@@ -18,6 +18,8 @@ from models.provision_request import (
     ProvisionTemplate,
     BUILTIN_TEMPLATES
 )
+from utils.user_data import generate_node_exporter_user_data
+from utils.prometheus_config import PrometheusConfigManager
 
 logger = logging.getLogger("rift.agents.provisioner")
 
@@ -59,6 +61,10 @@ class ProvisionerAgent(BaseAgent):
         self.terraform_mcp = terraform_mcp
         self.do_mcp = do_mcp
         self.templates = {t.id: t for t in BUILTIN_TEMPLATES}
+        
+        # Initialize Prometheus configuration manager
+        # TODO: Get control_plane_ip from environment or config
+        self.prometheus_manager = None  # Will be initialized when needed
 
         logger.info("Provisioner Agent initialized with %d templates", len(self.templates))
 
@@ -191,6 +197,9 @@ class ProvisionerAgent(BaseAgent):
             logs.append("Extracting access information...")
             access_info = await self._extract_access_info(apply_result.output_values)
             resources_created = self._parse_created_resources(apply_result)
+
+            # Step 6.5: Auto-register with Prometheus (if droplet created)
+            await self._register_with_prometheus(resources_created, apply_result.output_values, logs)
 
             # Step 7: Update knowledge base
             logs.append("Updating knowledge base...")
@@ -341,8 +350,29 @@ provider "digitalocean" {{
         For Web Applications (Node.js, Python, etc.):
         - Use digitalocean_droplet with appropriate size (s-1vcpu-2gb for small, s-2vcpu-4gb for medium)
         - Include image = "ubuntu-22-04-x64" or "ubuntu-24-04-x64"
-        - Add user_data script to install dependencies and start the app
+        - CRITICAL: ALWAYS include user_data script that installs Node Exporter for monitoring:
+          user_data = <<-EOF
+            #!/bin/bash
+            # Install Node Exporter for Prometheus monitoring
+            cd /tmp
+            wget -q https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+            tar xzf node_exporter-1.6.1.linux-amd64.tar.gz
+            mv node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/
+            cat > /etc/systemd/system/node_exporter.service << 'EOT'
+            [Unit]
+            Description=Node Exporter
+            [Service]
+            ExecStart=/usr/local/bin/node_exporter
+            [Install]
+            WantedBy=multi-user.target
+            EOT
+            systemctl daemon-reload
+            systemctl enable node_exporter
+            systemctl start node_exporter
+            # Add application-specific setup here
+          EOF
         - Enable monitoring = true and backups = true
+        - ALWAYS add tag "rift" for auto-discovery
         - Create outputs: droplet_id, droplet_name, ipv4_address, app_url
 
         For Databases (MongoDB, PostgreSQL, MySQL, Redis):
@@ -388,7 +418,17 @@ provider "digitalocean" {{
         - do_token (sensitive, no default)
         - region (default: "{request.region}")
         - environment (default: "{request.environment}")
-        - tags (default: ["managed-by-rift"])
+        - tags (default: ["rift", "managed-by-rift"])
+        - ssh_key_id (default: from environment, for SSH access)
+        
+        CRITICAL TAGGING RULE:
+        ALL digitalocean_droplet resources MUST include tag "rift" for automatic monitoring discovery.
+        Example: tags = concat(var.tags, ["rift"])
+        
+        CRITICAL SSH KEY RULE:
+        ALL digitalocean_droplet resources MUST include ssh_keys parameter for autonomous remediation.
+        Example: ssh_keys = [var.ssh_key_id]
+        This enables automatic SSH access for monitoring and remediation without manual setup.
 
         NAMING CONVENTION:
         Use descriptive names: "webapp-server", "mongodb-cluster", "app-loadbalancer"
@@ -661,6 +701,8 @@ provider "aws" {{
 
     def _extract_variables(self, request: ProvisionRequest, cloud_credentials: Optional[List] = None) -> Dict[str, Any]:
         """Extract Terraform variables from request and cloud credentials."""
+        import os
+        
         # Get the detected provider (set during _generate_terraform)
         detected_provider = getattr(self, '_detected_provider', 'digitalocean')
         logger.info(f"🔍 _extract_variables called: detected_provider={detected_provider}, has_credentials={bool(cloud_credentials)}")
@@ -674,6 +716,14 @@ provider "aws" {{
         # Add default credentials based on detected provider
         if detected_provider == "digitalocean":
             variables["do_token"] = self.do_mcp.api_token
+            
+            # Add SSH key ID for automatic SSH access
+            ssh_key_id = os.getenv('SSH_KEY_ID')
+            if ssh_key_id:
+                variables["ssh_key_id"] = int(ssh_key_id)
+                logger.info(f"Added SSH key ID for autonomous remediation: {ssh_key_id}")
+            else:
+                logger.warning("SSH_KEY_ID not found in environment - new VMs won't have automatic SSH access")
 
         # Extract credentials from cloud_credentials if provided
         if cloud_credentials:
@@ -1024,6 +1074,84 @@ provider "aws" {{
         logger.debug(f"Extracted config length: {len(config)}")
         return config
 
+    async def _register_with_prometheus(
+        self,
+        resources_created: List[Dict[str, Any]],
+        outputs: Dict[str, Any],
+        logs: List[str]
+    ):
+        """
+        Automatically register newly created droplets with Prometheus
+        
+        Args:
+            resources_created: List of created resources
+            outputs: Terraform output values
+            logs: Provisioning logs to append to
+        """
+        try:
+            import os
+            
+            # Get control plane IP from environment
+            control_plane_ip = os.getenv('CONTROL_PLANE_IP', '104.236.4.131')
+            
+            if not control_plane_ip:
+                logger.warning("CONTROL_PLANE_IP not set, skipping Prometheus registration")
+                return
+            
+            # Initialize Prometheus manager if not already done
+            if not self.prometheus_manager:
+                self.prometheus_manager = PrometheusConfigManager(control_plane_ip)
+            
+            # Find droplets in created resources
+            droplets_to_register = []
+            
+            for resource in resources_created:
+                if resource.get('type') == 'droplet' or 'droplet' in resource.get('name', '').lower():
+                    droplet_name = resource.get('name', 'unknown')
+                    droplet_ip = None
+                    
+                    # Try to get IP from outputs
+                    for key, value in outputs.items():
+                        if 'ip' in key.lower() and droplet_name.lower() in key.lower():
+                            droplet_ip = value
+                            break
+                    
+                    # Fallback: check generic ip output keys
+                    if not droplet_ip:
+                        droplet_ip = outputs.get('ipv4_address') or outputs.get('ip_address') or outputs.get('public_ip')
+                    
+                    if droplet_ip:
+                        droplets_to_register.append({
+                            'name': droplet_name,
+                            'ip': droplet_ip
+                        })
+            
+            # Register each droplet with Prometheus
+            for droplet in droplets_to_register:
+                logs.append(f"Registering {droplet['name']} with Prometheus...")
+                
+                success = await self.prometheus_manager.add_target(
+                    job_name=droplet['name'],
+                    target_ip=droplet['ip'],
+                    target_port=9100,
+                    labels={'managed_by': 'rift'}
+                )
+                
+                if success:
+                    logs.append(f"✓ {droplet['name']} registered for monitoring at {droplet['ip']}:9100")
+                    logger.info(f"Registered {droplet['name']} ({droplet['ip']}) with Prometheus")
+                else:
+                    logs.append(f"⚠ Failed to register {droplet['name']} with Prometheus (will need manual setup)")
+                    logger.warning(f"Failed to register {droplet['name']} with Prometheus")
+            
+            if not droplets_to_register:
+                logger.debug("No droplets found to register with Prometheus")
+                
+        except Exception as e:
+            logger.error(f"Failed to register with Prometheus: {str(e)}", exc_info=True)
+            logs.append(f"⚠ Prometheus registration failed: {str(e)}")
+            # Don't fail the whole provisioning if Prometheus registration fails
+    
     async def _update_knowledge_base(
         self,
         request: ProvisionRequest,
