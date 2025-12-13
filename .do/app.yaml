@@ -1,0 +1,119 @@
+name: rift-backend
+region: nyc
+
+services:
+  - name: api
+    github:
+      repo: itisaby/rift
+      branch: main
+      deploy_on_push: true
+    
+    source_dir: /backend
+    
+    environment_slug: python
+    
+    envs:
+      - key: DIGITALOCEAN_API_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: PROMETHEUS_URL
+        value: "http://104.236.4.131:9090"
+        scope: RUN_TIME
+      
+      - key: CONTROL_PLANE_IP
+        value: "104.236.4.131"
+        scope: RUN_TIME
+      
+      - key: SSH_KEY_ID
+        value: "52635372"
+        scope: RUN_TIME
+      
+      - key: MONITOR_AGENT_ENDPOINT
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: MONITOR_AGENT_KEY
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: MONITOR_AGENT_ID
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: DIAGNOSTIC_AGENT_ENDPOINT
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: DIAGNOSTIC_AGENT_KEY
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: DIAGNOSTIC_AGENT_ID
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: REMEDIATION_AGENT_ENDPOINT
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: REMEDIATION_AGENT_KEY
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: REMEDIATION_AGENT_ID
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: PROVISIONER_AGENT_ENDPOINT
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: PROVISIONER_AGENT_KEY
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: PROVISIONER_AGENT_ID
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: KNOWLEDGE_BASE_ID
+        scope: RUN_TIME
+        type: SECRET
+      
+      - key: CONFIDENCE_THRESHOLD
+        value: "0.85"
+        scope: RUN_TIME
+      
+      - key: AUTO_REMEDIATION_ENABLED
+        value: "true"
+        scope: RUN_TIME
+      
+      - key: MAX_COST_AUTO_APPROVE
+        value: "50.0"
+        scope: RUN_TIME
+      
+      - key: LOG_LEVEL
+        value: "INFO"
+        scope: RUN_TIME
+    
+    build_command: pip install -r requirements.txt
+    
+    run_command: uvicorn main:app --host 0.0.0.0 --port 8080
+    
+    http_port: 8080
+    
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 30
+      period_seconds: 10
+      timeout_seconds: 5
+      success_threshold: 1
+      failure_threshold: 3
+
+alerts:
+  - rule: DEPLOYMENT_FAILED
+  - rule: DOMAIN_FAILED
