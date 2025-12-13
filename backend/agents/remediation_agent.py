@@ -10,6 +10,7 @@ import json
 
 from agents.base_agent import BaseAgent
 from agents.safety_validator import SafetyValidator
+from agents.direct_remediation import DirectRemediationExecutor
 from mcp_clients.terraform_mcp import TerraformMCP
 from mcp_clients.do_mcp import DigitalOceanMCP
 from models.incident import (
@@ -62,11 +63,14 @@ class RemediationAgent(BaseAgent):
         self.terraform_mcp = terraform_mcp
         self.do_mcp = do_mcp
         self.safety_validator = safety_validator
+        
+        # Initialize direct remediation executor for fast actions
+        self.direct_executor = DirectRemediationExecutor(do_mcp)
 
         # Store state backups for rollback
         self.state_backups: Dict[str, Any] = {}
 
-        logger.info("Remediation Agent initialized")
+        logger.info("Remediation Agent initialized with direct remediation support")
 
     async def execute_remediation(
         self,
@@ -100,6 +104,11 @@ class RemediationAgent(BaseAgent):
         try:
             logger.info(f"Executing remediation plan {plan.id}")
             logs.append(f"Starting remediation: {plan.action.value}")
+
+            # Check if this action can be executed directly (faster, safer)
+            if self._can_use_direct_remediation(plan.action):
+                logs.append("Using direct remediation (no Terraform needed)")
+                return await self._execute_direct_remediation(plan, logs, start_time)
 
             # Step 1: Generate Terraform configuration
             logs.append("Step 1: Generating Terraform configuration...")
@@ -469,6 +478,128 @@ class RemediationAgent(BaseAgent):
         import asyncio
         logger.debug(f"Waiting {seconds}s for metrics to stabilize...")
         await asyncio.sleep(seconds)
+
+    def _can_use_direct_remediation(self, action: RemediationAction) -> bool:
+        """
+        Check if an action can be executed directly without Terraform.
+        
+        Args:
+            action: The remediation action
+            
+        Returns:
+            True if direct remediation is available
+        """
+        direct_actions = {
+            RemediationAction.RESTART_SERVICE,
+            RemediationAction.CLEAN_DISK,
+        }
+        return action in direct_actions
+    
+    async def _execute_direct_remediation(
+        self,
+        plan: RemediationPlan,
+        logs: list,
+        start_time: float
+    ) -> RemediationResult:
+        """
+        Execute remediation using direct SSH/API actions (faster than Terraform).
+        
+        Args:
+            plan: Remediation plan
+            logs: Log list to append to
+            start_time: Start time for duration calculation
+            
+        Returns:
+            RemediationResult
+        """
+        import time
+        
+        try:
+            # Get droplet info from parameters
+            droplet_id = plan.parameters.get("droplet_id")
+            droplet_ip = plan.parameters.get("droplet_ip")
+            
+            if not droplet_ip and droplet_id:
+                # Fetch droplet IP from DO API
+                logs.append(f"Fetching droplet info for ID {droplet_id}...")
+                droplet = await self.do_mcp.get_droplet(int(droplet_id))
+                droplet_ip = None
+                
+                # Get public IP
+                for network in droplet.get("networks", {}).get("v4", []):
+                    if network.get("type") == "public":
+                        droplet_ip = network.get("ip_address")
+                        break
+                
+                if not droplet_ip:
+                    raise ValueError(f"Could not find public IP for droplet {droplet_id}")
+                
+                logs.append(f"Found droplet IP: {droplet_ip}")
+            
+            if not droplet_ip:
+                raise ValueError("No droplet IP provided in parameters")
+            
+            # Execute the appropriate direct action
+            if plan.action == RemediationAction.RESTART_SERVICE:
+                result = await self.direct_executor.restart_service_action(
+                    droplet_ip=droplet_ip,
+                    incident_details=plan.parameters
+                )
+            elif plan.action == RemediationAction.CLEAN_DISK:
+                result = await self.direct_executor.clean_disk_action(
+                    droplet_ip=droplet_ip,
+                    incident_details=plan.parameters
+                )
+            else:
+                raise ValueError(f"Direct remediation not implemented for {plan.action.value}")
+            
+            # Merge logs
+            logs.extend(result.logs)
+            
+            duration = int(time.time() - start_time)
+            
+            if result.success:
+                return RemediationResult(
+                    plan_id=plan.id,
+                    incident_id=plan.incident_id,
+                    status=RemediationStatus.SUCCESS,
+                    success=True,
+                    action_taken=plan.action_description,
+                    duration=duration,
+                    verification_passed=True,
+                    logs=logs,
+                    metadata={
+                        "direct_remediation": True,
+                        "details": result.details
+                    }
+                )
+            else:
+                return RemediationResult(
+                    plan_id=plan.id,
+                    incident_id=plan.incident_id,
+                    status=RemediationStatus.FAILED,
+                    success=False,
+                    action_taken=plan.action_description,
+                    duration=duration,
+                    verification_passed=False,
+                    error_message=result.message,
+                    logs=logs,
+                    metadata={
+                        "direct_remediation": True,
+                        "details": result.details
+                    }
+                )
+                
+        except Exception as e:
+            logger.error(f"Direct remediation failed: {str(e)}")
+            logs.append(f"❌ Direct remediation exception: {str(e)}")
+            
+            return self._create_failed_result(
+                plan=plan,
+                error_message=str(e),
+                duration=time.time() - start_time,
+                logs=logs
+            )
 
     def _create_failed_result(
         self,

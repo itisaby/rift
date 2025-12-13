@@ -125,7 +125,10 @@ class DiagnosticAgent(BaseAgent):
                 estimated_duration=estimated_duration,
                 metadata={
                     "state_analysis": state_analysis,
-                    "ai_full_response": diagnosis_text
+                    "ai_full_response": diagnosis_text,
+                    "infrastructure_state": state_analysis,  # Include droplet info for remediation
+                    "droplet_id": incident.resource_id,
+                    "resource_type": incident.resource_type.value
                 }
             )
 
@@ -205,6 +208,15 @@ class DiagnosticAgent(BaseAgent):
                 
                 if droplet_id:
                     droplet = await self.do_mcp.get_droplet(droplet_id)
+                    
+                    # Extract public IP address
+                    droplet_ip = None
+                    networks = droplet.get("networks", {}).get("v4", [])
+                    for network in networks:
+                        if network.get("type") == "public":
+                            droplet_ip = network.get("ip_address")
+                            break
+                    
                     analysis.update({
                         "current_size": droplet.get("size", {}).get("slug"),
                         "vcpus": droplet.get("vcpus"),
@@ -214,7 +226,9 @@ class DiagnosticAgent(BaseAgent):
                         "status": droplet.get("status"),
                         "created_at": droplet.get("created_at"),
                         "features": droplet.get("features", []),
-                        "tags": droplet.get("tags", [])
+                        "tags": droplet.get("tags", []),
+                        "droplet_ip": droplet_ip,  # Add IP for remediation
+                        "networks": droplet.get("networks", {})  # Full network info
                     })
                 else:
                     # Demo incident - use simulated data
@@ -501,7 +515,7 @@ class DiagnosticAgent(BaseAgent):
                 return RemediationAction.RESTART_SERVICE
 
     def _extract_remediation_parameters(self, plan_text: str, diagnosis: Diagnosis) -> Dict[str, Any]:
-        """Extract remediation parameters from plan text."""
+        """Extract remediation parameters from plan text and incident context."""
 
         parameters = {
             "diagnosis_id": diagnosis.id,
@@ -509,12 +523,45 @@ class DiagnosticAgent(BaseAgent):
             "root_cause": diagnosis.root_cause
         }
 
+        # Get droplet info from metadata (populated by analyze_infrastructure_state)
+        if diagnosis.metadata:
+            metadata = diagnosis.metadata
+            
+            # Get resource ID
+            if 'droplet_id' in metadata:
+                parameters["droplet_id"] = metadata['droplet_id']
+            if 'resource_type' in metadata:
+                parameters["resource_type"] = metadata['resource_type']
+            
+            # Get infrastructure state
+            if 'infrastructure_state' in metadata or 'state_analysis' in metadata:
+                state = metadata.get('infrastructure_state') or metadata.get('state_analysis', {})
+                
+                # Get droplet IP directly from state
+                if 'droplet_ip' in state and state['droplet_ip']:
+                    parameters["droplet_ip"] = state['droplet_ip']
+                    logger.info(f"Extracted droplet IP for remediation: {state['droplet_ip']}")
+                
+                # Also get resource_id if available
+                if 'resource_id' in state:
+                    parameters["droplet_id"] = state['resource_id']
+                
+                # Extract from networks if IP not found
+                if 'droplet_ip' not in parameters and 'networks' in state:
+                    networks = state.get('networks', {}).get('v4', [])
+                    for net in networks:
+                        if net.get('type') == 'public':
+                            parameters["droplet_ip"] = net.get('ip_address')
+                            logger.info(f"Extracted droplet IP from networks: {net.get('ip_address')}")
+                            break
+
         # Extract size parameters (e.g., "s-2vcpu-4gb")
         import re
         size_match = re.search(r's-\d+vcpu-\d+gb', plan_text)
         if size_match:
             parameters["new_size"] = size_match.group(0)
 
+        logger.info(f"Remediation parameters: {parameters}")
         return parameters
 
     async def _estimate_remediation(

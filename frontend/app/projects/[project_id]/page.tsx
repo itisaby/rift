@@ -134,7 +134,9 @@ export default function ProjectDetailsPage() {
     )
   }
 
-  const getSeverityColor = (severity: string) => {
+  const getSeverityColor = (severity: string | undefined) => {
+    if (!severity) return "text-gray-500 bg-gray-500/10 border-gray-500"
+    
     switch (severity.toLowerCase()) {
       case "critical": return "text-red-500 bg-red-500/10 border-red-500"
       case "high": return "text-orange-500 bg-orange-500/10 border-orange-500"
@@ -144,7 +146,9 @@ export default function ProjectDetailsPage() {
     }
   }
 
-  const getStatusColor = (status: string) => {
+  const getStatusColor = (status: string | undefined) => {
+    if (!status) return "bg-gray-500/20 text-gray-400 border-gray-500/50"
+    
     switch (status.toLowerCase()) {
       case "active": return "bg-green-500/20 text-green-400 border-green-500/50"
       case "inactive": return "bg-gray-500/20 text-gray-400 border-gray-500/50"
@@ -350,7 +354,7 @@ export default function ProjectDetailsPage() {
                           <div className="text-gray-400 text-xs mt-1">{incident.description}</div>
                         </div>
                         <Badge className={getSeverityColor(incident.severity)} variant="outline">
-                          {incident.severity}
+                          {incident.severity || 'Unknown'}
                         </Badge>
                       </div>
                       <div className="flex items-center gap-2 text-xs text-gray-500">
