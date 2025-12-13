@@ -532,8 +532,17 @@ async def provision_infrastructure(request: ProvisionRequest, project_id: str = 
             "project_id": project_id
         })
 
+        # Get project and cloud credentials if project_id provided
+        cloud_credentials = None
+        if project_id and hasattr(app.state, 'project_service'):
+            project = await app.state.project_service.get_project(project_id)
+            if project:
+                cloud_credentials = project.cloud_providers
+                logger.info("provision_with_project_credentials", project_id=project_id,
+                           providers=[cp.provider for cp in cloud_credentials])
+        
         # Execute provisioning
-        result = await app.state.provisioner_agent.provision(request)
+        result = await app.state.provisioner_agent.provision(request, cloud_credentials=cloud_credentials)
 
         # If provisioning succeeded and project_id provided, add resources to project
         if result.success and project_id and hasattr(app.state, 'project_service'):

@@ -196,6 +196,18 @@ class ProjectService:
         
         # Convert resources to nodes
         for i, resource in enumerate(project.resources):
+            # Ensure created_at is always a datetime
+            created_at = resource.get("created_at")
+            if not created_at:
+                created_at = datetime.utcnow()
+            elif isinstance(created_at, str):
+                # Parse ISO format string to datetime
+                from datetime import datetime as dt
+                try:
+                    created_at = dt.fromisoformat(created_at.replace('Z', '+00:00'))
+                except:
+                    created_at = datetime.utcnow()
+            
             node = InfrastructureNode(
                 id=resource.get("id", f"resource-{i}"),
                 name=resource.get("name", f"Resource {i}"),
@@ -203,7 +215,7 @@ class ProjectService:
                 provider=CloudProvider(resource.get("provider", "digitalocean")),
                 status=resource.get("status", "active"),
                 region=resource.get("region", "unknown"),
-                created_at=resource.get("created_at", datetime.utcnow()),
+                created_at=created_at,
                 cost_per_month=resource.get("cost_per_month"),
                 metrics=resource.get("metrics"),
                 tags=resource.get("tags", []),

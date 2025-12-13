@@ -64,7 +64,8 @@ class ProvisionerAgent(BaseAgent):
 
     async def provision(
         self,
-        request: ProvisionRequest
+        request: ProvisionRequest,
+        cloud_credentials: Optional[List] = None
     ) -> ProvisionResult:
         """
         Main provisioning workflow.
@@ -112,6 +113,10 @@ class ProvisionerAgent(BaseAgent):
 
             logs.append(f"Generated {len(terraform_config)} bytes of Terraform configuration")
 
+            # Step 1.5: Clean previous Terraform state
+            logs.append("Cleaning previous Terraform state...")
+            await self.terraform_mcp.clean_state()
+
             # Step 2: Validate configuration
             logs.append("Validating Terraform configuration...")
             validation = await self.terraform_mcp.validate_config(terraform_config)
@@ -149,7 +154,7 @@ class ProvisionerAgent(BaseAgent):
             logs.append("Running Terraform plan (dry-run)...")
             plan_result = await self.terraform_mcp.plan(
                 config=terraform_config,
-                variables=self._extract_variables(request)
+                variables=self._extract_variables(request, cloud_credentials)
             )
 
             if not plan_result.success:
@@ -168,7 +173,7 @@ class ProvisionerAgent(BaseAgent):
             logs.append("Applying Terraform configuration...")
             apply_result = await self.terraform_mcp.apply(
                 config=terraform_config,
-                variables=self._extract_variables(request),
+                variables=self._extract_variables(request, cloud_credentials),
                 auto_approve=True
             )
 
@@ -234,8 +239,73 @@ class ProvisionerAgent(BaseAgent):
             Terraform configuration as string
         """
         logger.debug(f"Generating Terraform for: {request.description}")
+        
+        # Auto-detect cloud provider from request description
+        description_lower = request.description.lower()
+        cloud_provider = "digitalocean"  # Default
+        
+        aws_keywords = ["aws", "ec2", "rds", "s3", "lambda", "dynamodb", "elasticache", "alb", "elb", "amazon"]
+        do_keywords = ["digitalocean", "droplet", "do"]
+        
+        if any(keyword in description_lower for keyword in aws_keywords):
+            cloud_provider = "aws"
+            logger.info(f"Detected AWS provider from request: {request.description}")
+        elif any(keyword in description_lower for keyword in do_keywords):
+            cloud_provider = "digitalocean"
+            logger.info(f"Detected DigitalOcean provider from request: {request.description}")
+        
+        # Store detected provider for use in variable extraction
+        self._detected_provider = cloud_provider
+        
+        # Generate appropriate prompt based on cloud provider
+        if cloud_provider == "aws":
+            prompt = self._generate_aws_prompt(request)
+        else:
+            prompt = self._generate_digitalocean_prompt(request)
+        
+        try:
+            response = await self.query_agent(
+                prompt=prompt,
+                use_knowledge_base=True
+            )
 
-        prompt = f"""
+            terraform_config = response.get("response", "")
+            
+            # Log raw response for debugging
+            logger.debug(f"Raw AI response length: {len(terraform_config)} bytes")
+            logger.debug(f"Raw AI response preview: {terraform_config[:500]}...")
+
+            # Clean up response (remove markdown code blocks if present)
+            terraform_config = self._extract_terraform_code(terraform_config)
+            
+            # Post-process to fix common AI mistakes
+            terraform_config = self._fix_terraform_config(terraform_config)
+
+            logger.info(f"Generated Terraform configuration ({len(terraform_config)} bytes)")
+            
+            if not terraform_config:
+                logger.error("Terraform extraction resulted in empty config")
+                raw_response = response.get('response', '')
+                logger.error(f"Original response length: {len(raw_response)} bytes")
+                logger.error(f"Original response preview: {raw_response[:2000]}")
+                logger.error(f"Response contains 'terraform': {'terraform' in raw_response.lower()}")
+                logger.error(f"Response contains 'resource': {'resource' in raw_response.lower()}")
+                logger.error(f"Response contains code blocks: {'```' in raw_response}")
+                
+                # Last resort: if response contains terraform keywords, use it as-is
+                if 'terraform' in raw_response.lower() or 'resource' in raw_response.lower():
+                    logger.warning("Attempting to use raw response as Terraform code")
+                    terraform_config = raw_response
+
+            return terraform_config
+
+        except Exception as e:
+            logger.error(f"Failed to generate Terraform: {str(e)}", exc_info=True)
+            raise
+
+    def _generate_digitalocean_prompt(self, request: ProvisionRequest) -> str:
+        """Generate DigitalOcean-specific Terraform prompt"""
+        return f"""
         You are an expert infrastructure engineer specializing in DigitalOcean and Terraform.
         Generate complete, production-ready Terraform 1.x configuration based on this request:
 
@@ -325,46 +395,140 @@ provider "digitalocean" {{
 
         Return ONLY the Terraform HCL code, no explanations or markdown formatting.
         """
+    
+    def _generate_aws_prompt(self, request: ProvisionRequest) -> str:
+        """Generate AWS-specific Terraform prompt"""
+        return f"""
+        You are an expert infrastructure engineer specializing in AWS and Terraform.
+        Generate complete, production-ready Terraform 1.x configuration based on this request:
 
-        try:
-            response = await self.query_agent(
-                prompt=prompt,
-                use_knowledge_base=True
-            )
+        Request: {request.description}
 
-            terraform_config = response.get("response", "")
-            
-            # Log raw response for debugging
-            logger.debug(f"Raw AI response length: {len(terraform_config)} bytes")
-            logger.debug(f"Raw AI response preview: {terraform_config[:500]}...")
+        Requirements:
+        - Region: {request.region}
+        - Environment: {request.environment}
+        - Budget Limit: ${request.budget_limit or "unlimited"}
+        - Tags: {', '.join(request.tags) if request.tags else 'none'}
 
-            # Clean up response (remove markdown code blocks if present)
-            terraform_config = self._extract_terraform_code(terraform_config)
-            
-            # Post-process to fix common AI mistakes
-            terraform_config = self._fix_terraform_config(terraform_config)
+        CRITICAL: Your Terraform configuration MUST begin with EXACTLY this block:
+        
+terraform {{
+  required_version = ">= 1.0.0"
+  required_providers {{
+    aws = {{
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }}
+  }}
+}}
 
-            logger.info(f"Generated Terraform configuration ({len(terraform_config)} bytes)")
-            
-            if not terraform_config:
-                logger.error("Terraform extraction resulted in empty config")
-                raw_response = response.get('response', '')
-                logger.error(f"Original response length: {len(raw_response)} bytes")
-                logger.error(f"Original response preview: {raw_response[:2000]}")
-                logger.error(f"Response contains 'terraform': {'terraform' in raw_response.lower()}")
-                logger.error(f"Response contains 'resource': {'resource' in raw_response.lower()}")
-                logger.error(f"Response contains code blocks: {'```' in raw_response}")
-                
-                # Last resort: if response contains terraform keywords, use it as-is
-                if 'terraform' in raw_response.lower() or 'resource' in raw_response.lower():
-                    logger.warning("Attempting to use raw response as Terraform code")
-                    terraform_config = raw_response.strip()
-            
-            return terraform_config
+provider "aws" {{
+  region     = var.aws_region
+  access_key = var.aws_access_key_id
+  secret_key = var.aws_secret_access_key
+}}
 
-        except Exception as e:
-            logger.error(f"Failed to generate Terraform: {str(e)}")
-            return ""
+        RESOURCE GUIDELINES BY REQUEST TYPE:
+
+        For Web Applications (Node.js, Python, etc.) on EC2:
+        - Use aws_instance resource
+        - AMI for us-east-1: ami-0c02fb55b5c849e3f (Ubuntu 22.04 LTS)
+        - AMI for other regions: Use Ubuntu 22.04 LTS or Amazon Linux 2023
+        - instance_type: t3.micro (small), t3.small (medium), t3.medium (larger)
+        - Include user_data script to install dependencies and start the app
+        - Create aws_security_group allowing HTTP (80), HTTPS (443), SSH (22)
+        - Enable monitoring = true
+        - Add tags for Name, Environment, ManagedBy
+        - Use associate_public_ip_address = true for public access
+        - CRITICAL: Use "aws_subnets" data source (NOT aws_subnet_ids which is deprecated)
+        - CRITICAL: Use instance.public_ip (NOT ipv4_address) for outputs
+        - Create outputs: instance_id, public_ip, public_dns, app_url
+
+        For Databases (RDS PostgreSQL, MySQL):
+        - Use aws_db_instance resource
+        - engine: "postgres" or "mysql"
+        - engine_version: "16.1" (postgres) or "8.0" (mysql)
+        - instance_class: db.t3.micro, db.t3.small, db.t3.medium
+        - allocated_storage: 20-100 GB
+        - multi_az = true for production
+        - Create aws_db_subnet_group with at least 2 subnets
+        - Create aws_security_group for database access
+        - Set backup_retention_period = 7 for production
+        - Create outputs: db_endpoint, db_name, db_port, db_address
+
+        For Load Balancers:
+        - Use aws_lb resource (Application Load Balancer)
+        - load_balancer_type = "application"
+        - Create aws_lb_target_group with health_check
+        - Create aws_lb_listener on port 80/443
+        - Attach EC2 instances using aws_lb_target_group_attachment
+        - Create outputs: lb_dns_name, lb_arn, lb_zone_id
+
+        For VPCs and Networking:
+        - SIMPLE APPROACH (Recommended): Use default VPC - just create aws_security_group (no VPC/subnet creation)
+        - Default VPC exists in all AWS regions, don't query for it
+        - Security groups work in default VPC automatically
+        - AVOID data sources (aws_vpc, aws_subnets) - they cause slow provisioning
+        - If VPC required: Create aws_vpc with cidr_block (e.g., "10.0.0.0/16")
+        - Create aws_subnet (public and private subnets across 2 AZs)
+        - Create aws_internet_gateway for public internet access
+        - Create aws_route_table and aws_route_table_association
+
+        IMPORTANT RULES:
+        1. CRITICAL: Use valid AMI ID for the region - ami-0c02fb55b5c849e3f for us-east-1 (Ubuntu 22.04)
+        2. Always include meaningful outputs with resource IDs, IPs, DNS names
+        3. Use tags on all resources: Name, Environment, ManagedBy
+        4. Enable monitoring and backups for production (environment = "production")
+        5. Use VPC and private subnets for database connections
+        6. Include proper health checks for load balancers
+        7. Set appropriate instance sizes based on workload (see budget limit)
+        8. Use Multi-AZ for production databases
+        9. NEVER use template provider - use locals block with heredoc syntax instead
+        10. For user_data, use inline heredoc: user_data = <<-EOF ... EOF (NOT data "template_file")
+
+        REQUIRED VARIABLES:
+        - aws_access_key_id (sensitive, no default)
+        - aws_secret_access_key (sensitive, no default)
+        - aws_region (default: "{request.region}")
+        - environment (default: "{request.environment}")
+
+        NAMING CONVENTION:
+        Use descriptive names with environment: "prod-webapp-server", "prod-postgres-db", "prod-app-lb"
+
+        EXAMPLE CORRECT SYNTAX FOR DEFAULT VPC:
+        data "aws_vpc" "default" {{
+          default = true
+        }}
+
+        data "aws_subnets" "default" {{
+          filter {{
+            name   = "vpc-id"
+            values = [data.aws_vpc.default.id]
+          }}
+        }}
+
+        resource "aws_instance" "example" {{
+          ami           = "ami-0c55b159cbfafe1f0"
+          instance_type = "t3.micro"
+          subnet_id     = tolist(data.aws_subnets.default.ids)[0]
+          
+          tags = {{
+            Name = "example-instance"
+          }}
+        }}
+
+        output "public_ip" {{
+          value = aws_instance.example.public_ip
+        }}
+
+        CRITICAL RULES TO FOLLOW:
+        1. ALWAYS use "public_ip" attribute (NEVER use ipv4_address or public_ipv4)
+        2. ALWAYS use "aws_subnets" data source (NEVER use aws_subnet_ids)
+        3. Access subnet IDs with: tolist(data.aws_subnets.default.ids)[0]
+        4. Outputs must use: instance.public_ip and instance.public_dns
+
+        Return ONLY the Terraform HCL code, no explanations or markdown formatting.
+        """
 
     async def _generate_from_template(
         self,
@@ -495,18 +659,62 @@ provider "digitalocean" {{
         }
         return pricing.get(size, 15.0)
 
-    def _extract_variables(self, request: ProvisionRequest) -> Dict[str, Any]:
-        """Extract Terraform variables from request."""
+    def _extract_variables(self, request: ProvisionRequest, cloud_credentials: Optional[List] = None) -> Dict[str, Any]:
+        """Extract Terraform variables from request and cloud credentials."""
+        # Get the detected provider (set during _generate_terraform)
+        detected_provider = getattr(self, '_detected_provider', 'digitalocean')
+        logger.info(f"🔍 _extract_variables called: detected_provider={detected_provider}, has_credentials={bool(cloud_credentials)}")
+        
         variables = {
-            "do_token": self.do_mcp.api_token,  # DigitalOcean API token
             "region": request.region,
             "environment": request.environment,
             "tags": request.tags
         }
+        
+        # Add default credentials based on detected provider
+        if detected_provider == "digitalocean":
+            variables["do_token"] = self.do_mcp.api_token
+
+        # Extract credentials from cloud_credentials if provided
+        if cloud_credentials:
+            for cred in cloud_credentials:
+                provider = cred.provider if hasattr(cred, 'provider') else cred.get('provider')
+                credentials = cred.credentials if hasattr(cred, 'credentials') else cred.get('credentials', {})
+                
+                # Only extract variables for the detected provider
+                if provider != detected_provider:
+                    logger.debug(f"Skipping credentials for {provider}, detected provider is {detected_provider}")
+                    continue
+                
+                logger.info(f"Extracting credentials for detected provider: {provider}")
+                
+                if provider == "digitalocean":
+                    if "api_token" in credentials:
+                        variables["do_token"] = credentials["api_token"]
+                    variables["region"] = request.region
+                    
+                elif provider == "aws":
+                    # Add AWS credentials
+                    if "access_key_id" in credentials:
+                        variables["aws_access_key_id"] = credentials["access_key_id"]
+                    if "secret_access_key" in credentials:
+                        variables["aws_secret_access_key"] = credentials["secret_access_key"]
+                    
+                    # AWS region should come from AWS credential's region, not request.region
+                    if hasattr(cred, 'region') and cred.region:
+                        variables["aws_region"] = cred.region
+                    elif 'region' in cred if isinstance(cred, dict) else False:
+                        variables["aws_region"] = cred['region']
+                    else:
+                        # Default to us-east-1 if no region specified
+                        variables["aws_region"] = "us-east-1"
+                    
+                    logger.info(f"Using AWS region: {variables.get('aws_region')}")
 
         if request.template_params:
             variables.update(request.template_params)
 
+        logger.info(f"✅ Final variables: {list(variables.keys())}")
         return variables
 
     async def _extract_access_info(
@@ -656,11 +864,74 @@ provider "digitalocean" {{
         config = config.replace('digitaldocean = {', 'digitalocean = {')
         config = config.replace('"digitaldocean"', '"digitalocean"')
         
+        # Fix AWS-specific issues
+        import re
+        
+        # CRITICAL FIX: Remove slow data sources for VPC and subnets
+        # These queries take forever - AWS has default VPC, no need to query
+        if 'data "aws_vpc"' in config or 'data "aws_subnets"' in config:
+            # Remove data source blocks (including nested blocks)
+            # Match multi-line blocks with nested filter blocks
+            config = re.sub(r'data\s+"aws_vpc"\s+"[^"]+"\s+\{[^}]*\}\s*', '', config, flags=re.DOTALL)
+            config = re.sub(r'data\s+"aws_subnets"\s+"[^"]+"\s+\{(?:[^{}]|\{[^}]*\})*\}\s*', '', config, flags=re.DOTALL)
+            
+            # Remove vpc_id references from security groups (works without it in default VPC)
+            config = re.sub(r'\n\s*vpc_id\s*=\s*data\.aws_vpc\.[^\n]+', '', config)
+            
+            # Remove subnet_id references from instances (use default subnet automatically)
+            # Keep the newline character
+            config = re.sub(r'\n\s*subnet_id\s*=\s*tolist\(data\.aws_subnets[^\n]+', '', config)
+            config = re.sub(r'\n\s*subnet_id\s*=\s*data\.aws_subnets[^\n]+', '', config)
+            
+            # Clean up multiple blank lines
+            config = re.sub(r'\n\s*\n\s*\n+', '\n\n', config)
+        
+        # Fix deprecated aws_subnet_ids -> aws_subnets (if any remain)
+        config = config.replace('data "aws_subnet_ids"', 'data "aws_subnets"')
+        config = config.replace('data.aws_subnet_ids', 'data.aws_subnets')
+        
+        # Fix incorrect AWS EC2 instance attribute names for outputs
+        # aws_instance uses .public_ip NOT .ipv4_address
+        config = re.sub(
+            r'(aws_instance\.[^\.]+)\.ipv4_address',
+            r'\1.public_ip',
+            config
+        )
+        
+        # Fix deprecated template provider (not available on darwin_arm64)
+        # Replace data "template_file" with locals and templatefile()
+        if 'data "template_file"' in config:
+            # Extract the template content and convert to locals block
+            template_pattern = r'data\s+"template_file"\s+"([^"]+)"\s+\{[^}]*template\s+=\s+<<-EOF\s*(.*?)\s*EOF[^}]*\}'
+            matches = re.finditer(template_pattern, config, re.DOTALL)
+            
+            for match in matches:
+                template_name = match.group(1)
+                template_content = match.group(2)
+                
+                # Remove the data block
+                config = config.replace(match.group(0), '')
+                
+                # Add locals block if not present
+                if 'locals {' not in config:
+                    # Insert after provider block
+                    provider_end = config.find('}', config.find('provider "aws"'))
+                    if provider_end > 0:
+                        config = config[:provider_end+1] + '\n\nlocals {\n  ' + template_name + ' = <<-EOT\n' + template_content + '\n  EOT\n}\n' + config[provider_end+1:]
+                
+                # Replace references to data.template_file.X.rendered with local.X
+                config = config.replace(f'data.template_file.{template_name}.rendered', f'local.{template_name}')
+        
         # Fix incorrect DigitalOcean attribute names
         # Do most specific replacements first to avoid double-replacements
         config = config.replace('.private_ipv4_address', '.ipv4_address_private')
         config = config.replace('.private_ip', '.ipv4_address_private')
-        config = config.replace('.public_ip', '.ipv4_address')
+        # Only replace public_ip for DigitalOcean droplets, not AWS instances
+        config = re.sub(
+            r'(digitalocean_droplet\.[^\.]+)\.public_ip',
+            r'\1.ipv4_address',
+            config
+        )
         
         # Fix any double-replacement errors
         config = config.replace('.ipv4_address_privatev4_address', '.ipv4_address_private')

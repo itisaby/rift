@@ -111,17 +111,67 @@ class TerraformMCP:
                 env=command_env
             )
 
-            stdout, stderr = await process.communicate()
+            # Set timeout to 120 seconds for terraform operations
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=120.0
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Terraform command timed out after 120 seconds: {' '.join(cmd)}")
+                process.kill()
+                await process.wait()
+                raise TimeoutError(f"Terraform command timed out: {' '.join(cmd)}")
 
             return (
-                process.returncode,
+                process.returncode or 0,
                 stdout.decode('utf-8'),
                 stderr.decode('utf-8')
             )
 
+        except TimeoutError:
+            raise
         except Exception as e:
             logger.error(f"Failed to run terraform command: {str(e)}")
             raise
+
+    async def clean_state(self) -> bool:
+        """
+        Clean Terraform state files to start fresh.
+        Useful when switching between different infrastructure configurations.
+
+        Returns:
+            True if cleaning successful
+        """
+        try:
+            working_path = Path(self.working_dir)
+            
+            # Remove state files
+            for state_file in ["terraform.tfstate", "terraform.tfstate.backup"]:
+                state_path = working_path / state_file
+                if state_path.exists():
+                    state_path.unlink()
+                    logger.debug(f"Removed {state_file}")
+            
+            # Remove lock file
+            lock_file = working_path / ".terraform.lock.hcl"
+            if lock_file.exists():
+                lock_file.unlink()
+                logger.debug("Removed .terraform.lock.hcl")
+            
+            # Remove .terraform directory
+            terraform_dir = working_path / ".terraform"
+            if terraform_dir.exists():
+                import shutil
+                shutil.rmtree(terraform_dir)
+                logger.debug("Removed .terraform directory")
+            
+            logger.info("Terraform state cleaned successfully")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to clean Terraform state: {str(e)}")
+            return False
 
     async def init(self, backend_config: Optional[Dict[str, str]] = None) -> bool:
         """
