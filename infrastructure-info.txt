@@ -1,0 +1,30 @@
+# Rift Infrastructure Information
+# Generated: Thu Dec 11 17:08:17 EST 2025
+
+## Droplet IPs
+CONTROL_PLANE_IP=104.236.4.131
+WEB_APP_IP=165.227.72.218
+API_SERVER_IP=174.138.62.125
+
+## Droplet Access
+# SSH to droplets:
+ssh root@104.236.4.131
+ssh root@165.227.72.218
+ssh root@174.138.62.125
+
+## Next Steps
+1. Install Prometheus on control-plane:
+   ssh root@104.236.4.131
+   # Follow instructions in backend/SETUP.md
+
+2. Install Node Exporter on web-app and api-server:
+   ssh root@165.227.72.218
+   # Follow instructions in backend/SETUP.md
+
+3. Create Gradient AI agents at:
+   https://cloud.digitalocean.com/ai
+
+4. Update backend/.env with these IPs and agent credentials
+
+5. Run verification:
+   cd backend && python verify_setup.py
