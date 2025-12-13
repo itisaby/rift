@@ -186,7 +186,7 @@ scrape_configs:
 
   - job_name: 'web-app'
     static_configs:
-      - targets: ['165.227.72.218:9100']
+      - targets: ['134.209.37.250:9100']
 
   - job_name: 'api-server'
     static_configs:

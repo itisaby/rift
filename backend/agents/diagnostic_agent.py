@@ -196,19 +196,37 @@ class DiagnosticAgent(BaseAgent):
 
             # Get resource details based on type
             if incident.resource_type == ResourceType.DROPLET:
-                droplet = await self.do_mcp.get_droplet(int(incident.resource_id))
-
-                analysis.update({
-                    "current_size": droplet.get("size", {}).get("slug"),
-                    "vcpus": droplet.get("vcpus"),
-                    "memory_mb": droplet.get("memory"),
-                    "disk_gb": droplet.get("disk"),
-                    "region": droplet.get("region", {}).get("slug"),
-                    "status": droplet.get("status"),
-                    "created_at": droplet.get("created_at"),
-                    "features": droplet.get("features", []),
-                    "tags": droplet.get("tags", [])
-                })
+                # Check if this is a demo incident (metadata.demo = true) or if resource_id is not numeric
+                is_demo = incident.metadata and incident.metadata.get("demo", False)
+                try:
+                    droplet_id = int(incident.resource_id) if not is_demo else None
+                except (ValueError, TypeError):
+                    droplet_id = None
+                
+                if droplet_id:
+                    droplet = await self.do_mcp.get_droplet(droplet_id)
+                    analysis.update({
+                        "current_size": droplet.get("size", {}).get("slug"),
+                        "vcpus": droplet.get("vcpus"),
+                        "memory_mb": droplet.get("memory"),
+                        "disk_gb": droplet.get("disk"),
+                        "region": droplet.get("region", {}).get("slug"),
+                        "status": droplet.get("status"),
+                        "created_at": droplet.get("created_at"),
+                        "features": droplet.get("features", []),
+                        "tags": droplet.get("tags", [])
+                    })
+                else:
+                    # Demo incident - use simulated data
+                    analysis.update({
+                        "current_size": "s-1vcpu-1gb",
+                        "vcpus": 1,
+                        "memory_mb": 1024,
+                        "disk_gb": 25,
+                        "region": "nyc3",
+                        "status": "active",
+                        "demo_mode": True
+                    })
 
             # Add metric-specific analysis
             analysis["affected_metric"] = incident.metric.value

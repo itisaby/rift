@@ -3,13 +3,13 @@
 
 ## Droplet IPs
 CONTROL_PLANE_IP=104.236.4.131
-WEB_APP_IP=165.227.72.218
+WEB_APP_IP=134.209.37.250
 API_SERVER_IP=174.138.62.125
 
 ## Droplet Access
 # SSH to droplets:
 ssh root@104.236.4.131
-ssh root@165.227.72.218
+ssh root@134.209.37.250
 ssh root@174.138.62.125
 
 ## Next Steps
@@ -18,7 +18,7 @@ ssh root@174.138.62.125
    # Follow instructions in backend/SETUP.md
 
 2. Install Node Exporter on web-app and api-server:
-   ssh root@165.227.72.218
+   ssh root@134.209.37.250
    # Follow instructions in backend/SETUP.md
 
 3. Create Gradient AI agents at:

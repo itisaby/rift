@@ -144,6 +144,9 @@ async def initialize_system():
     app.state.coordinator = coordinator
     app.state.project_service = project_service
     app.state.connection_manager = ConnectionManager()
+    
+    # Set connection manager on coordinator for WebSocket broadcasts
+    coordinator.connection_manager = app.state.connection_manager
 
     logger.info("✓ Rift system initialized successfully")
 
@@ -358,7 +361,7 @@ async def detect_incidents():
 
 
 @app.post("/incidents/diagnose", response_model=Diagnosis)
-async def diagnose_incident(incident_id: str):
+async def diagnose_incident(request: dict):
     """
     Diagnose a specific incident
     Uses RAG to find root cause and recommendations
@@ -366,12 +369,26 @@ async def diagnose_incident(incident_id: str):
     if not hasattr(app.state, 'diagnostic_agent'):
         raise HTTPException(status_code=503, detail="Diagnostic Agent not initialized")
 
+    incident_id = request.get("incident_id")
+    if not incident_id:
+        raise HTTPException(status_code=400, detail="incident_id is required")
+    
+    # Handle "ID: {uuid}" format from frontend
+    if incident_id.startswith("ID: "):
+        incident_id = incident_id[4:]
+
     logger.info("manual_diagnosis_triggered", incident_id=incident_id)
 
     # Find the incident
     incident = app.state.coordinator.active_incidents.get(incident_id)
     if not incident:
-        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+        # Log available incidents for debugging
+        available_ids = list(app.state.coordinator.active_incidents.keys())
+        logger.error("incident_not_found", 
+                    incident_id=incident_id, 
+                    available_incidents=available_ids,
+                    count=len(available_ids))
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found. Available: {available_ids}")
 
     try:
         diagnosis = await app.state.diagnostic_agent.diagnose_incident(incident)
@@ -380,10 +397,15 @@ async def diagnose_incident(incident_id: str):
         app.state.coordinator.diagnoses[incident_id] = diagnosis
 
         # Broadcast via WebSocket
+        diagnosis_dict = diagnosis.dict()
+        # Convert datetime objects to ISO format strings
+        if "timestamp" in diagnosis_dict and diagnosis_dict["timestamp"]:
+            diagnosis_dict["timestamp"] = diagnosis_dict["timestamp"].isoformat()
+        
         await app.state.connection_manager.broadcast({
-            "type": "diagnosis_complete",
+            "type": "diagnosis_completed",
             "incident_id": incident_id,
-            "diagnosis": diagnosis.dict()
+            "diagnosis": diagnosis_dict
         })
 
         return diagnosis
@@ -394,13 +416,23 @@ async def diagnose_incident(incident_id: str):
 
 
 @app.post("/incidents/remediate", response_model=RemediationResult)
-async def remediate_incident(incident_id: str, auto_approve: bool = False):
+async def remediate_incident(request: dict):
     """
     Execute remediation for an incident
     Optionally auto-approve if within safety thresholds
     """
     if not hasattr(app.state, 'remediation_agent'):
         raise HTTPException(status_code=503, detail="Remediation Agent not initialized")
+
+    incident_id = request.get("incident_id")
+    auto_approve = request.get("auto_approve", False)
+    
+    if not incident_id:
+        raise HTTPException(status_code=400, detail="incident_id is required")
+    
+    # Handle "ID: {uuid}" format from frontend
+    if incident_id.startswith("ID: "):
+        incident_id = incident_id[4:]
 
     logger.info("manual_remediation_triggered", incident_id=incident_id, auto_approve=auto_approve)
 
@@ -423,10 +455,19 @@ async def remediate_incident(incident_id: str, auto_approve: bool = False):
         app.state.coordinator.results[incident_id] = result
 
         # Broadcast via WebSocket
+        result_dict = result.dict()
+        # Convert datetime objects to ISO format strings
+        if "timestamp" in result_dict and result_dict["timestamp"]:
+            result_dict["timestamp"] = result_dict["timestamp"].isoformat()
+        if "execution_start" in result_dict and result_dict["execution_start"]:
+            result_dict["execution_start"] = result_dict["execution_start"].isoformat()
+        if "execution_end" in result_dict and result_dict["execution_end"]:
+            result_dict["execution_end"] = result_dict["execution_end"].isoformat()
+        
         await app.state.connection_manager.broadcast({
-            "type": "remediation_complete",
+            "type": "remediation_completed",
             "incident_id": incident_id,
-            "result": result.dict()
+            "result": result_dict
         })
 
         return result
@@ -455,7 +496,9 @@ async def get_incident(incident_id: str):
     response = {
         "incident": incident.dict(),
         "diagnosis": diagnosis.dict() if diagnosis else None,
-        "remediation_result": result.dict() if result else None
+        "remediation": result.dict() if result else None,
+        "has_diagnosis": diagnosis is not None,
+        "has_remediation": result is not None
     }
 
     return response
@@ -697,6 +740,12 @@ class ConnectionManager:
 
     async def broadcast(self, message: dict):
         """Broadcast message to all connected clients"""
+        logger.info(
+            "broadcasting_message",
+            message_type=message.get("type"),
+            connection_count=len(self.active_connections),
+            message=f"Broadcasting {message.get('type')} to {len(self.active_connections)} clients"
+        )
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
@@ -946,18 +995,26 @@ async def inject_failure(
     metric = failure_metric_map.get(failure_type.lower(), MetricType.CPU_USAGE)
     current_value, threshold = failure_values.get(failure_type.lower(), (95.0, 80.0))
 
+    # Map target names to real droplet IDs for realistic demos
+    target_to_id = {
+        "web-app": "536761938",
+        "control-plane": "536356505",
+        "api-server": "536356595"
+    }
+    resource_id = target_to_id.get(target, f"demo-{target}")
+
     # Create simulated incident
     incident = Incident(
         id=str(uuid.uuid4()),
         timestamp=datetime.now(UTC),
-        resource_id=f"demo-{target}",
+        resource_id=resource_id,
         resource_name=target,
         resource_type=ResourceType.DROPLET,
         metric=metric,
         current_value=current_value,
         threshold_value=threshold,
         severity=SeverityLevel.HIGH,
-        status="DETECTED",
+        status="detected",
         description=f"Demo {failure_type} failure injected on {target}",
         metadata={
             "demo": True,
@@ -968,21 +1025,22 @@ async def inject_failure(
     )
 
     # Add to coordinator's incident tracking
-    if coordinator:
-        coordinator.active_incidents[incident.id] = incident
-        coordinator.statistics["total_incidents"] += 1
+    if app.state.coordinator:
+        app.state.coordinator.active_incidents[incident.id] = incident
+        app.state.coordinator.stats["incidents_detected"] += 1
 
         # Broadcast via WebSocket
-        await connection_manager.broadcast({
-            "type": "incident_detected",
-            "incident": {
-                "id": incident.id,
-                "resource_name": incident.resource_name,
-                "metric": incident.metric,
-                "severity": incident.severity,
-                "timestamp": incident.timestamp.isoformat()
-            }
-        })
+        if hasattr(app.state, 'connection_manager'):
+            await app.state.connection_manager.broadcast({
+                "type": "incident_detected",
+                "incident": {
+                    "id": incident.id,
+                    "resource_name": incident.resource_name,
+                    "metric": incident.metric,
+                    "severity": incident.severity,
+                    "timestamp": incident.timestamp.isoformat()
+                }
+            })
 
     return {
         "success": True,

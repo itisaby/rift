@@ -60,6 +60,9 @@ class Coordinator:
         self.confidence_threshold = confidence_threshold
         self.auto_remediation_enabled = auto_remediation_enabled
         self.check_interval = check_interval
+        
+        # WebSocket connection manager (set after initialization)
+        self.connection_manager: Optional[Any] = None
 
         # State tracking
         self.active_incidents: Dict[str, Incident] = {}
@@ -172,6 +175,16 @@ class Coordinator:
             self.active_incidents[incident.id] = incident
             self.stats["incidents_detected"] += 1
 
+            # Broadcast incident detection to WebSocket clients
+            if self.connection_manager:
+                incident_dict = incident.model_dump()
+                if "timestamp" in incident_dict and incident_dict["timestamp"]:
+                    incident_dict["timestamp"] = incident_dict["timestamp"].isoformat()
+                await self.connection_manager.broadcast({
+                    "type": "incident_detected",
+                    "incident": incident_dict
+                })
+
             # Update incident status
             incident.status = IncidentStatus.DIAGNOSING
 
@@ -197,6 +210,28 @@ class Coordinator:
 
             # Update incident status
             incident.status = IncidentStatus.DIAGNOSED
+            
+            # Broadcast diagnosis to WebSocket clients
+            if self.connection_manager:
+                logger.info(
+                    "broadcasting_diagnosis",
+                    incident_id=incident.id,
+                    diagnosis_id=diagnosis.id,
+                    confidence=diagnosis.confidence
+                )
+                diagnosis_dict = diagnosis.model_dump()
+                if "timestamp" in diagnosis_dict and diagnosis_dict["timestamp"]:
+                    diagnosis_dict["timestamp"] = diagnosis_dict["timestamp"].isoformat()
+                await self.connection_manager.broadcast({
+                    "type": "diagnosis_completed",
+                    "incident_id": incident.id,
+                    "diagnosis": diagnosis_dict
+                })
+            else:
+                logger.warning(
+                    "no_connection_manager",
+                    message="Connection manager not available for broadcast"
+                )
 
             # Step 2: Check if we should remediate
             should_remediate = (
@@ -267,6 +302,21 @@ class Coordinator:
                 "duration": result.duration,
                 "actual_cost": result.actual_cost
             })
+            
+            # Broadcast remediation result to WebSocket clients
+            if self.connection_manager:
+                result_dict = result.model_dump()
+                if "timestamp" in result_dict and result_dict["timestamp"]:
+                    result_dict["timestamp"] = result_dict["timestamp"].isoformat()
+                if "execution_start" in result_dict and result_dict["execution_start"]:
+                    result_dict["execution_start"] = result_dict["execution_start"].isoformat()
+                if "execution_end" in result_dict and result_dict["execution_end"]:
+                    result_dict["execution_end"] = result_dict["execution_end"].isoformat()
+                await self.connection_manager.broadcast({
+                    "type": "remediation_completed",
+                    "incident_id": incident.id,
+                    "result": result_dict
+                })
 
             # Step 5: Update incident status
             if result.success and result.verification_passed:

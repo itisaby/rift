@@ -30,7 +30,7 @@ class MonitorAgent(BaseAgent):
 
     # Default thresholds for metrics
     DEFAULT_THRESHOLDS = {
-        MetricType.CPU_USAGE: 80.0,
+        MetricType.CPU_USAGE: 60.0,  # Lowered for demo - detect at 60%
         MetricType.MEMORY_USAGE: 85.0,
         MetricType.DISK_USAGE: 90.0
     }

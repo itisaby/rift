@@ -7,6 +7,7 @@ import { ArrowLeft, Activity, Clock, AlertTriangle, CheckCircle2, Zap, TrendingU
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { useWebSocket } from "@/lib/useWebSocket"
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
 
@@ -64,10 +65,6 @@ export default function IncidentDetailPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    fetchIncidentDetail()
-  }, [incident_id])
-
   const fetchIncidentDetail = async () => {
     try {
       const response = await fetch(`${API_URL}/incidents/${incident_id}`)
@@ -85,6 +82,35 @@ export default function IncidentDetailPage() {
       setLoading(false)
     }
   }
+
+  // WebSocket for real-time updates
+  const WS_URL = API_URL.replace('http://', 'ws://').replace('https://', 'wss://')
+  const { lastMessage } = useWebSocket(`${WS_URL}/ws/events`, {
+    onMessage: (message) => {
+      // Update when diagnosis completes for this incident
+      if (message.type === 'diagnosis_completed' && message.incident_id === incident_id) {
+        console.log('Diagnosis completed, refreshing...', message)
+        fetchIncidentDetail()
+      }
+      
+      // Update when remediation completes for this incident
+      if (message.type === 'remediation_completed' && message.incident_id === incident_id) {
+        console.log('Remediation completed, refreshing...', message)
+        fetchIncidentDetail()
+      }
+      
+      // Update when incident is detected (initial creation)
+      if (message.type === 'incident_detected' && message.incident?.id === incident_id) {
+        console.log('Incident updated, refreshing...', message)
+        fetchIncidentDetail()
+      }
+    }
+  })
+
+  useEffect(() => {
+    fetchIncidentDetail()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [incident_id])
 
   const getSeverityColor = (severity: string) => {
     switch (severity.toLowerCase()) {
