@@ -2,9 +2,9 @@
 
 > **Rift through operational complexity**
 
-Autonomous infrastructure orchestration powered by DigitalOcean Gradient AI + Model Context Protocol. 
+Autonomous infrastructure orchestration and remediation powered by DigitalOcean Gradient AI + Model Context Protocol. 
 
-This is a Vibe-coded project, just made out of fun in a hackathon weekend.
+This is a Vibe-coded project, I just made out of fun in a hackathon weekend as I like the idea.
 
 **Opening rifts to create, closing rifts to fix - all at machine speed.**
 
