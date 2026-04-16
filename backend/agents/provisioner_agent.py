@@ -531,8 +531,28 @@ provider "aws" {{
           }}
           Then reference: ami = data.aws_ami.ubuntu.id
         - instance_type: t3.micro (small), t3.small (medium), t3.medium (larger)
-        - Include user_data script to install dependencies and start the app
-        - Create aws_security_group allowing HTTP (80), HTTPS (443), SSH (22)
+        - CRITICAL: ALWAYS include user_data script that installs Node Exporter for monitoring:
+          user_data = <<-EOF
+            #!/bin/bash
+            # Install Node Exporter for Prometheus monitoring
+            cd /tmp
+            wget -q https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+            tar xzf node_exporter-1.6.1.linux-amd64.tar.gz
+            mv node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/
+            cat > /etc/systemd/system/node_exporter.service << 'EOT'
+            [Unit]
+            Description=Node Exporter
+            [Service]
+            ExecStart=/usr/local/bin/node_exporter
+            [Install]
+            WantedBy=multi-user.target
+            EOT
+            systemctl daemon-reload
+            systemctl enable node_exporter
+            systemctl start node_exporter
+            # Add application-specific setup here
+          EOF
+        - Create aws_security_group allowing HTTP (80), HTTPS (443), SSH (22), AND Node Exporter (9100)
         - Enable monitoring = true
         - Add tags for Name, Environment, ManagedBy
         - Use associate_public_ip_address = true for public access
@@ -1153,7 +1173,82 @@ data "aws_ami" "ubuntu" {
                 new_lines.append(line)
         
         config = '\n'.join(new_lines)
-        
+
+        # SAFETY NET: Inject node_exporter into user_data if it's missing
+        # This ensures all VMs get monitoring support regardless of what the AI generated
+        node_exporter_snippet = (
+            'cd /tmp && '
+            'wget -q https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz && '
+            'tar xzf node_exporter-1.6.1.linux-amd64.tar.gz && '
+            'mv node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/ && '
+            'cat > /etc/systemd/system/node_exporter.service << EOSVC\n'
+            '[Unit]\nDescription=Node Exporter\n[Service]\nExecStart=/usr/local/bin/node_exporter\n'
+            '[Install]\nWantedBy=multi-user.target\nEOSVC\n'
+            'systemctl daemon-reload && systemctl enable node_exporter && systemctl start node_exporter'
+        )
+        if 'user_data' in config and 'node_exporter' not in config:
+            # Find user_data heredoc and inject node_exporter before the closing EOF
+            def _inject_node_exporter(m):
+                content = m.group(0)
+                # Find the last EOF in the user_data block
+                eof_markers = ['EOF', 'EOT', 'USERDATA']
+                for marker in eof_markers:
+                    idx = content.rfind(f'\n{marker}')
+                    if idx == -1:
+                        idx = content.rfind(f'\n  {marker}')
+                    if idx == -1:
+                        idx = content.rfind(f'\n    {marker}')
+                    if idx == -1:
+                        idx = content.rfind(f'\n      {marker}')
+                    if idx >= 0:
+                        return content[:idx] + '\n# Install Node Exporter for monitoring\n' + node_exporter_snippet + '\n' + content[idx:]
+                return content
+
+            config = re.sub(
+                r'user_data\s*=\s*<<-?\s*\w+.*?(?:EOF|EOT|USERDATA)',
+                _inject_node_exporter,
+                config, flags=re.DOTALL
+            )
+            logger.info("Injected node_exporter into user_data")
+
+        # SAFETY NET: Add port 9100 to AWS security groups if not already present
+        if 'aws_security_group' in config and '9100' not in config:
+            # Add an ingress rule for node_exporter before the last closing brace of the security group
+            node_exporter_rule = '''
+  ingress {
+    from_port   = 9100
+    to_port     = 9100
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Node Exporter"
+  }
+'''
+            # Find last ingress block in security group and append after it
+            last_ingress = None
+            for m in re.finditer(r'ingress\s+\{[^}]*\}', config, re.DOTALL):
+                last_ingress = m
+            if last_ingress:
+                insert_pos = last_ingress.end()
+                config = config[:insert_pos] + node_exporter_rule + config[insert_pos:]
+                logger.info("Injected port 9100 ingress rule into security group")
+
+        # SAFETY NET: Add port 9100 to DO firewall if present and missing
+        if 'digitalocean_firewall' in config and '9100' not in config:
+            last_inbound = None
+            for m in re.finditer(r'inbound_rule\s+\{[^}]*\}', config, re.DOTALL):
+                last_inbound = m
+            if last_inbound:
+                do_rule = '''
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "9100"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+'''
+                insert_pos = last_inbound.end()
+                config = config[:insert_pos] + do_rule + config[insert_pos:]
+                logger.info("Injected port 9100 inbound rule into DO firewall")
+
         logger.debug("Applied terraform config fixes")
         return config
     
@@ -1223,52 +1318,80 @@ data "aws_ami" "ubuntu" {
             logs: Provisioning logs to append to
         """
         try:
-            # Find droplets in created resources
-            droplets_to_register = []
+            # Find all VM-like resources (droplets, EC2 instances) to register
+            targets_to_register = []
+            registered_ips = set()
 
             for resource in resources_created:
-                if resource.get('type') == 'droplet' or 'droplet' in resource.get('name', '').lower():
-                    droplet_name = resource.get('name', 'unknown')
-                    droplet_ip = None
+                res_type = resource.get('type', '').lower()
+                res_name = resource.get('name', 'unknown')
 
-                    # Try to get IP from outputs
+                # Match any VM-like resource type
+                is_vm = res_type in ('droplet', 'ec2_instance', 'vm', 'instance', 'resource')
+
+                if not is_vm:
+                    continue
+
+                # Try to get IP from the resource itself
+                res_ip = resource.get('ipv4_address') or resource.get('public_ip')
+
+                # Try to get IP from terraform outputs
+                if not res_ip:
                     for key, value in outputs.items():
-                        if 'ip' in key.lower() and droplet_name.lower() in key.lower():
-                            droplet_ip = value
+                        key_lower = key.lower()
+                        # Match output keys like do_public_ip, aws_public_ip, ipv4_address, public_ip
+                        if ('ip' in key_lower and 'private' not in key_lower
+                                and isinstance(value, str) and '.' in value
+                                and value not in registered_ips):
+                            res_ip = value
                             break
 
-                    # Fallback: check generic ip output keys
-                    if not droplet_ip:
-                        droplet_ip = outputs.get('ipv4_address') or outputs.get('ip_address') or outputs.get('public_ip')
+                if res_ip and res_ip not in registered_ips:
+                    registered_ips.add(res_ip)
+                    targets_to_register.append({
+                        'name': res_name,
+                        'ip': res_ip,
+                        'provider': resource.get('provider', 'unknown'),
+                    })
 
-                    if droplet_ip:
-                        droplets_to_register.append({
-                            'name': droplet_name,
-                            'ip': droplet_ip
+            # If no resources matched but outputs have IPs, register those directly
+            if not targets_to_register:
+                for key, value in outputs.items():
+                    key_lower = key.lower()
+                    if ('ip' in key_lower and 'private' not in key_lower
+                            and isinstance(value, str) and '.' in value
+                            and value not in registered_ips):
+                        # Derive a name from the output key: "aws_public_ip" → "aws-server"
+                        prefix = key.replace('_public_ip', '').replace('_ip', '').replace('_', '-')
+                        registered_ips.add(value)
+                        targets_to_register.append({
+                            'name': f"{prefix}-server",
+                            'ip': value,
+                            'provider': 'aws' if 'aws' in key_lower else 'digitalocean',
                         })
 
-            # Register each droplet with Prometheus via infra MCP server
-            for droplet in droplets_to_register:
-                logs.append(f"Registering {droplet['name']} with Prometheus via MCP...")
+            # Register each target with Prometheus via infra MCP server
+            for target in targets_to_register:
+                logs.append(f"Registering {target['name']} ({target['provider']}) with Prometheus...")
 
                 result = await self.call_mcp("infra", "infra_manage_prometheus_targets", {
                     "action": "add",
-                    "job_name": droplet['name'],
-                    "target_ip": droplet['ip'],
+                    "job_name": target['name'],
+                    "target_ip": target['ip'],
                     "target_port": 9100,
-                    "labels": {"managed_by": "rift"}
+                    "labels": {"managed_by": "rift", "provider": target['provider']}
                 })
 
                 if result.get("success"):
-                    logs.append(f"✓ {droplet['name']} registered for monitoring at {droplet['ip']}:9100")
-                    logger.info(f"Registered {droplet['name']} ({droplet['ip']}) with Prometheus via MCP")
+                    logs.append(f"✓ {target['name']} registered for monitoring at {target['ip']}:9100")
+                    logger.info(f"Registered {target['name']} ({target['ip']}) with Prometheus")
                 else:
                     error = result.get("error", "unknown error")
-                    logs.append(f"⚠ Failed to register {droplet['name']} with Prometheus: {error}")
-                    logger.warning(f"Failed to register {droplet['name']} with Prometheus: {error}")
+                    logs.append(f"⚠ Failed to register {target['name']} with Prometheus: {error}")
+                    logger.warning(f"Failed to register {target['name']} with Prometheus: {error}")
 
-            if not droplets_to_register:
-                logger.debug("No droplets found to register with Prometheus")
+            if not targets_to_register:
+                logger.debug("No VM resources found to register with Prometheus")
 
         except Exception as e:
             logger.error(f"Failed to register with Prometheus: {str(e)}", exc_info=True)

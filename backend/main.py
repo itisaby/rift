@@ -671,7 +671,11 @@ async def provision_infrastructure(request: ProvisionRequest, project_id: str = 
                     "type": resource.get("type", "unknown"),
                     "provider": provider,
                     "status": "active",
-                    "region": request.region or "nyc3",
+                    "region": resource.get("region") or next(
+                        (cp.region for cp in (cloud_credentials or [])
+                         if cp.provider == provider and cp.region),
+                        None
+                    ) or request.region or "nyc3",
                     "cost_per_month": result.cost_estimate / len(result.resources_created) if result.resources_created else 0,
                     "created_at": resource.get("created_at"),
                     "tags": request.tags or [],

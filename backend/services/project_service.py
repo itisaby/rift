@@ -194,35 +194,43 @@ class ProjectService:
         nodes = []
         edges = []
         
-        # Convert resources to nodes
+        # Group resources by provider for better layout
+        by_provider = {}
         for i, resource in enumerate(project.resources):
-            # Ensure created_at is always a datetime
-            created_at = resource.get("created_at")
-            if not created_at:
-                created_at = datetime.utcnow()
-            elif isinstance(created_at, str):
-                # Parse ISO format string to datetime
-                from datetime import datetime as dt
-                try:
-                    created_at = dt.fromisoformat(created_at.replace('Z', '+00:00'))
-                except:
+            provider = resource.get("provider", "digitalocean")
+            by_provider.setdefault(provider, []).append((i, resource))
+
+        # Layout: each provider group gets a column, nodes stacked vertically
+        col_width = 300
+        row_height = 120
+        start_y = 80  # leave room for provider label
+        for col_idx, (provider, items) in enumerate(by_provider.items()):
+            for row_idx, (orig_idx, resource) in enumerate(items):
+                created_at = resource.get("created_at")
+                if not created_at:
                     created_at = datetime.utcnow()
-            
-            node = InfrastructureNode(
-                id=resource.get("id", f"resource-{i}"),
-                name=resource.get("name", f"Resource {i}"),
-                type=resource.get("type", "unknown"),
-                provider=CloudProvider(resource.get("provider", "digitalocean")),
-                status=resource.get("status", "active"),
-                region=resource.get("region", "unknown"),
-                created_at=created_at,
-                cost_per_month=resource.get("cost_per_month"),
-                metrics=resource.get("metrics"),
-                tags=resource.get("tags", []),
-                x=float(i % 5) * 150,  # Simple grid layout
-                y=float(i // 5) * 150
-            )
-            nodes.append(node)
+                elif isinstance(created_at, str):
+                    from datetime import datetime as dt
+                    try:
+                        created_at = dt.fromisoformat(created_at.replace('Z', '+00:00'))
+                    except:
+                        created_at = datetime.utcnow()
+
+                node = InfrastructureNode(
+                    id=resource.get("id", f"resource-{orig_idx}"),
+                    name=resource.get("name", f"Resource {orig_idx}"),
+                    type=resource.get("type", "unknown"),
+                    provider=CloudProvider(resource.get("provider", "digitalocean")),
+                    status=resource.get("status", "active"),
+                    region=resource.get("region", "unknown"),
+                    created_at=created_at,
+                    cost_per_month=resource.get("cost_per_month"),
+                    metrics=resource.get("metrics"),
+                    tags=resource.get("tags", []),
+                    x=float(col_idx) * col_width + 40,
+                    y=float(row_idx) * row_height + start_y
+                )
+                nodes.append(node)
             
             # Create edges based on dependencies
             if "dependencies" in resource:
