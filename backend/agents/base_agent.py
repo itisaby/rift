@@ -6,6 +6,7 @@ Foundation class for all AI agents in the system
 import httpx
 import asyncio
 import logging
+import re
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import json
@@ -27,7 +28,8 @@ class BaseAgent:
         agent_name: str,
         knowledge_base_id: Optional[str] = None,
         max_retries: int = 3,
-        timeout: int = 60
+        timeout: int = 60,
+        mcp_manager=None
     ):
         """
         Initialize base agent.
@@ -40,6 +42,7 @@ class BaseAgent:
             knowledge_base_id: Optional knowledge base ID for RAG
             max_retries: Maximum number of retry attempts
             timeout: Request timeout in seconds
+            mcp_manager: MCPSessionManager instance for tool calls
         """
         self.agent_endpoint = agent_endpoint
         self.agent_key = agent_key
@@ -48,6 +51,7 @@ class BaseAgent:
         self.knowledge_base_id = knowledge_base_id
         self.max_retries = max_retries
         self.timeout = timeout
+        self.mcp_manager = mcp_manager
 
         # Initialize HTTP client
         self.client = httpx.AsyncClient(
@@ -59,6 +63,22 @@ class BaseAgent:
         )
 
         logger.info(f"Initialized {agent_name} agent (ID: {agent_id})")
+
+    async def call_mcp(self, server_name: str, tool_name: str, arguments: Dict[str, Any] = None) -> Any:
+        """
+        Call a tool on an MCP server via the session manager.
+
+        Args:
+            server_name: MCP server name (e.g. "do", "terraform", "prometheus")
+            tool_name: Tool name to call
+            arguments: Tool arguments
+
+        Returns:
+            Parsed result from the MCP server
+        """
+        if not self.mcp_manager:
+            raise RuntimeError(f"{self.agent_name}: No MCP manager configured")
+        return await self.mcp_manager.call(server_name, tool_name, arguments or {})
 
     async def query_agent(
         self,
@@ -130,7 +150,11 @@ class BaseAgent:
                     logger.error(f"{self.agent_name}: Full result: {result}")
                 
                 assistant_message = choices[0].get("message", {}).get("content", "") if choices else ""
-                
+
+                # Strip <think>...</think> reasoning blocks (DeepSeek/reasoning models)
+                if assistant_message and '<think>' in assistant_message:
+                    assistant_message = re.sub(r'<think>.*?</think>', '', assistant_message, flags=re.DOTALL).strip()
+
                 logger.debug(f"{self.agent_name}: Assistant message length: {len(assistant_message)} chars")
 
                 # Return in a simplified format

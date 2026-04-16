@@ -8,8 +8,6 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from agents.base_agent import BaseAgent
-from mcp_clients.terraform_mcp import TerraformMCP
-from mcp_clients.do_mcp import DigitalOceanMCP
 from models.incident import (
     Incident,
     Diagnosis,
@@ -36,8 +34,7 @@ class DiagnosticAgent(BaseAgent):
         agent_key: str,
         agent_id: str,
         knowledge_base_id: str,
-        terraform_mcp: TerraformMCP,
-        do_mcp: DigitalOceanMCP
+        mcp_manager=None
     ):
         """
         Initialize Diagnostic Agent.
@@ -47,19 +44,16 @@ class DiagnosticAgent(BaseAgent):
             agent_key: API key for authentication
             agent_id: Unique agent identifier
             knowledge_base_id: Knowledge base ID for RAG
-            terraform_mcp: Terraform MCP client instance
-            do_mcp: DigitalOcean MCP client instance
+            mcp_manager: MCPSessionManager instance
         """
         super().__init__(
             agent_endpoint=agent_endpoint,
             agent_key=agent_key,
             agent_id=agent_id,
             agent_name="Diagnostic Agent",
-            knowledge_base_id=knowledge_base_id
+            knowledge_base_id=knowledge_base_id,
+            mcp_manager=mcp_manager
         )
-
-        self.terraform_mcp = terraform_mcp
-        self.do_mcp = do_mcp
 
         logger.info("Diagnostic Agent initialized with knowledge base")
 
@@ -207,7 +201,7 @@ class DiagnosticAgent(BaseAgent):
                     droplet_id = None
                 
                 if droplet_id:
-                    droplet = await self.do_mcp.get_droplet(droplet_id)
+                    droplet = await self.call_mcp("do", "get_droplet", {"droplet_id": droplet_id})
                     
                     # Extract public IP address
                     droplet_ip = None
@@ -495,19 +489,23 @@ class DiagnosticAgent(BaseAgent):
 
         plan_lower = plan_text.lower()
 
-        if "resize" in plan_lower or "scale" in plan_lower:
-            return RemediationAction.RESIZE_DROPLET
-        elif "volume" in plan_lower or "disk" in plan_lower:
-            return RemediationAction.ADD_VOLUME
-        elif "restart" in plan_lower or "reboot" in plan_lower:
+        # Prioritize direct actions (SSH-based, fast) over Terraform actions
+        # Kill/restart is the right first response for CPU spikes
+        if any(kw in plan_lower for kw in ["kill", "process", "restart", "reboot", "stress", "terminate"]):
             return RemediationAction.RESTART_SERVICE
+        elif any(kw in plan_lower for kw in ["clean", "log rotation", "journalctl", "apt clean"]):
+            return RemediationAction.CLEAN_DISK
         elif "firewall" in plan_lower or "security" in plan_lower:
             return RemediationAction.UPDATE_FIREWALL
-        elif "clean" in plan_lower:
-            return RemediationAction.CLEAN_DISK
+        elif "volume" in plan_lower or ("disk" in plan_lower and "add" in plan_lower):
+            return RemediationAction.ADD_VOLUME
+        elif "resize" in plan_lower or "scale" in plan_lower:
+            return RemediationAction.RESIZE_DROPLET
         else:
-            # Default based on category
-            if category == "capacity":
+            # Default based on category — prefer fast direct actions
+            if category == "performance":
+                return RemediationAction.RESTART_SERVICE
+            elif category == "capacity":
                 return RemediationAction.RESIZE_DROPLET
             elif category == "security":
                 return RemediationAction.UPDATE_FIREWALL

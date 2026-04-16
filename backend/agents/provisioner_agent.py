@@ -4,13 +4,12 @@ Proactive infrastructure provisioning based on natural language requests
 """
 
 import logging
+import os
 import time
 from typing import Dict, Any, Optional, List
 import json
 
 from agents.base_agent import BaseAgent
-from mcp_clients.terraform_mcp import TerraformMCP
-from mcp_clients.do_mcp import DigitalOceanMCP
 from models.provision_request import (
     ProvisionRequest,
     ProvisionResult,
@@ -19,7 +18,6 @@ from models.provision_request import (
     BUILTIN_TEMPLATES
 )
 from utils.user_data import generate_node_exporter_user_data
-from utils.prometheus_config import PrometheusConfigManager
 
 logger = logging.getLogger("rift.agents.provisioner")
 
@@ -35,8 +33,7 @@ class ProvisionerAgent(BaseAgent):
         agent_endpoint: str,
         agent_key: str,
         agent_id: str,
-        terraform_mcp: TerraformMCP,
-        do_mcp: DigitalOceanMCP,
+        mcp_manager=None,
         knowledge_base_id: Optional[str] = None
     ):
         """
@@ -46,8 +43,7 @@ class ProvisionerAgent(BaseAgent):
             agent_endpoint: Gradient AI agent endpoint URL
             agent_key: API key for authentication
             agent_id: Unique agent identifier
-            terraform_mcp: Terraform MCP client instance
-            do_mcp: DigitalOcean MCP client instance
+            mcp_manager: MCPSessionManager instance
             knowledge_base_id: Optional knowledge base ID
         """
         super().__init__(
@@ -55,23 +51,20 @@ class ProvisionerAgent(BaseAgent):
             agent_key=agent_key,
             agent_id=agent_id,
             agent_name="Provisioner Agent",
-            knowledge_base_id=knowledge_base_id
+            knowledge_base_id=knowledge_base_id,
+            mcp_manager=mcp_manager
         )
 
-        self.terraform_mcp = terraform_mcp
-        self.do_mcp = do_mcp
         self.templates = {t.id: t for t in BUILTIN_TEMPLATES}
-        
-        # Initialize Prometheus configuration manager
-        # TODO: Get control_plane_ip from environment or config
-        self.prometheus_manager = None  # Will be initialized when needed
 
         logger.info("Provisioner Agent initialized with %d templates", len(self.templates))
 
     async def provision(
         self,
         request: ProvisionRequest,
-        cloud_credentials: Optional[List] = None
+        cloud_credentials: Optional[List] = None,
+        project_id: Optional[str] = None,
+        broadcast_fn=None
     ) -> ProvisionResult:
         """
         Main provisioning workflow.
@@ -86,12 +79,33 @@ class ProvisionerAgent(BaseAgent):
 
         Args:
             request: ProvisionRequest with user's infrastructure needs
+            cloud_credentials: Optional cloud provider credentials
+            project_id: Optional project ID for per-project state
+            broadcast_fn: Optional async callback for real-time WebSocket updates
 
         Returns:
             ProvisionResult with created resources and access info
         """
         start_time = time.time()
         logs = []
+
+        async def _broadcast_step(step: str, detail: str, status: str = "running",
+                                  mcp_server: str = None, mcp_tool: str = None):
+            """Broadcast a provisioning step via WebSocket for real-time UI updates."""
+            if broadcast_fn:
+                try:
+                    await broadcast_fn({
+                        "type": "provision_step",
+                        "request_id": request.request_id,
+                        "step": step,
+                        "detail": detail,
+                        "status": status,
+                        "mcp_server": mcp_server,
+                        "mcp_tool": mcp_tool,
+                        "elapsed": round(time.time() - start_time, 1),
+                    })
+                except Exception as e:
+                    logger.debug(f"Broadcast failed (non-fatal): {e}")
 
         try:
             logger.info(f"Starting provisioning request: {request.request_id}")
@@ -101,12 +115,14 @@ class ProvisionerAgent(BaseAgent):
             # Step 1: Generate or load Terraform configuration
             if request.template:
                 logs.append(f"Using template: {request.template}")
+                await _broadcast_step("generate_config", f"Loading template: {request.template}", "running")
                 terraform_config = await self._generate_from_template(
                     request.template,
                     request.template_params or {}
                 )
             else:
                 logs.append("Generating Terraform from natural language request...")
+                await _broadcast_step("generate_config", "AI generating Terraform from natural language", "running", mcp_server="gradient-ai", mcp_tool="query_agent")
                 terraform_config = await self._generate_terraform(request)
 
             if not terraform_config:
@@ -118,34 +134,48 @@ class ProvisionerAgent(BaseAgent):
                 )
 
             logs.append(f"Generated {len(terraform_config)} bytes of Terraform configuration")
+            await _broadcast_step("generate_config", f"Generated {len(terraform_config)} bytes of Terraform HCL", "done", mcp_server="gradient-ai", mcp_tool="query_agent")
 
-            # Step 1.5: Clean previous Terraform state
-            logs.append("Cleaning previous Terraform state...")
-            await self.terraform_mcp.clean_state()
+            # Compute per-project working directory for state persistence
+            if project_id:
+                working_dir = os.path.join(".", "data", "terraform", project_id)
+                os.makedirs(working_dir, exist_ok=True)
+                logs.append(f"Using per-project terraform dir: {working_dir}")
+            else:
+                working_dir = None  # Falls back to global TF_WORKING_DIR in MCP server
+                logs.append("No project_id — using global terraform working directory")
 
             # Step 2: Validate configuration
-            logs.append("Validating Terraform configuration...")
-            validation = await self.terraform_mcp.validate_config(terraform_config)
+            logs.append("[MCP:terraform] Calling terraform_validate...")
+            await _broadcast_step("validate", "Validating Terraform configuration", "running", mcp_server="terraform", mcp_tool="terraform_validate")
+            validation = await self.call_mcp("terraform", "terraform_validate", {
+                "config": terraform_config,
+                **({"working_dir": working_dir} if working_dir else {})
+            })
 
-            if not validation.valid:
+            if not validation.get("valid"):
+                await _broadcast_step("validate", f"Validation failed: {', '.join(validation.get('errors', []))}", "error", mcp_server="terraform", mcp_tool="terraform_validate")
                 return self._create_failed_result(
                     request=request,
-                    error=f"Terraform validation failed: {', '.join(validation.errors)}",
+                    error=f"Terraform validation failed: {', '.join(validation.get('errors', []))}",
                     logs=logs,
                     duration=time.time() - start_time,
-                    validation_errors=validation.errors
+                    validation_errors=validation.get("errors", [])
                 )
 
-            logs.append("✓ Terraform configuration is valid")
+            logs.append("[MCP:terraform] ✓ terraform_validate → valid")
+            await _broadcast_step("validate", "Configuration is valid", "done", mcp_server="terraform", mcp_tool="terraform_validate")
 
-            if validation.warnings:
-                for warning in validation.warnings:
+            if validation.get("warnings"):
+                for warning in validation.get("warnings", []):
                     logs.append(f"⚠️  Warning: {warning}")
 
             # Step 3: Estimate costs
             logs.append("Estimating infrastructure costs...")
+            await _broadcast_step("estimate_cost", "Analyzing resource costs", "running")
             cost_estimate = await self._estimate_cost(request, terraform_config)
             logs.append(f"Estimated monthly cost: ${cost_estimate:.2f}")
+            await _broadcast_step("estimate_cost", f"Estimated ${cost_estimate:.2f}/month", "done")
 
             # Check budget limit
             if request.budget_limit and cost_estimate > request.budget_limit:
@@ -157,53 +187,71 @@ class ProvisionerAgent(BaseAgent):
                 )
 
             # Step 4: Plan Terraform changes
-            logs.append("Running Terraform plan (dry-run)...")
-            plan_result = await self.terraform_mcp.plan(
-                config=terraform_config,
-                variables=self._extract_variables(request, cloud_credentials)
-            )
+            logs.append("[MCP:terraform] Calling terraform_plan...")
+            await _broadcast_step("plan", "Running Terraform plan (dry-run)", "running", mcp_server="terraform", mcp_tool="terraform_plan")
+            plan_result = await self.call_mcp("terraform", "terraform_plan", {
+                "config": terraform_config,
+                "variables": self._extract_variables(request, cloud_credentials),
+                **({"working_dir": working_dir} if working_dir else {})
+            })
 
-            if not plan_result.success:
+            if not plan_result.get("success"):
+                await _broadcast_step("plan", f"Plan failed", "error", mcp_server="terraform", mcp_tool="terraform_plan")
                 return self._create_failed_result(
                     request=request,
-                    error=f"Terraform plan failed: {plan_result.plan_output}",
+                    error=f"Terraform plan failed: {plan_result.get('plan_output', '')}",
                     logs=logs,
                     duration=time.time() - start_time
                 )
 
-            logs.append(f"Plan: {plan_result.resources_to_add} to add, "
-                       f"{plan_result.resources_to_change} to change, "
-                       f"{plan_result.resources_to_destroy} to destroy")
+            add_n = plan_result.get('resources_to_add', 0)
+            chg_n = plan_result.get('resources_to_change', 0)
+            del_n = plan_result.get('resources_to_destroy', 0)
+            logs.append(f"[MCP:terraform] ✓ terraform_plan → {add_n} to add, {chg_n} to change, {del_n} to destroy")
+            await _broadcast_step("plan", f"{add_n} to add, {chg_n} to change, {del_n} to destroy", "done", mcp_server="terraform", mcp_tool="terraform_plan")
 
             # Step 5: Apply configuration
-            logs.append("Applying Terraform configuration...")
-            apply_result = await self.terraform_mcp.apply(
-                config=terraform_config,
-                variables=self._extract_variables(request, cloud_credentials),
-                auto_approve=True
-            )
+            logs.append("[MCP:terraform] Calling terraform_apply (auto_approve=true)...")
+            await _broadcast_step("apply", "Applying Terraform configuration (this may take a few minutes)", "running", mcp_server="terraform", mcp_tool="terraform_apply")
+            apply_result = await self.call_mcp("terraform", "terraform_apply", {
+                "config": terraform_config,
+                "variables": self._extract_variables(request, cloud_credentials),
+                "auto_approve": True,
+                **({"working_dir": working_dir} if working_dir else {})
+            })
 
-            if not apply_result.success:
+            if not apply_result.get("success"):
+                await _broadcast_step("apply", f"Apply failed: {apply_result.get('error_message', '')[:100]}", "error", mcp_server="terraform", mcp_tool="terraform_apply")
                 return self._create_failed_result(
                     request=request,
-                    error=f"Terraform apply failed: {apply_result.error_message}",
+                    error=f"Terraform apply failed: {apply_result.get('error_message', '')}",
                     logs=logs,
                     duration=time.time() - start_time
                 )
 
-            logs.append(f"✓ Successfully created {apply_result.resources_created} resource(s)")
+            created_n = apply_result.get('resources_created', 0)
+            logs.append(f"[MCP:terraform] ✓ terraform_apply → created {created_n} resource(s)")
+            await _broadcast_step("apply", f"Created {created_n} resource(s) successfully", "done", mcp_server="terraform", mcp_tool="terraform_apply")
 
             # Step 6: Extract access information
             logs.append("Extracting access information...")
-            access_info = await self._extract_access_info(apply_result.output_values)
+            await _broadcast_step("extract_outputs", "Reading Terraform outputs", "running", mcp_server="terraform", mcp_tool="terraform_get_outputs")
+            access_info = await self._extract_access_info(apply_result.get("output_values", {}))
             resources_created = self._parse_created_resources(apply_result)
+            await _broadcast_step("extract_outputs", f"Extracted {len(access_info)} access endpoints", "done", mcp_server="terraform", mcp_tool="terraform_get_outputs")
 
             # Step 6.5: Auto-register with Prometheus (if droplet created)
-            await self._register_with_prometheus(resources_created, apply_result.output_values, logs)
+            if resources_created:
+                await _broadcast_step("prometheus_register", "Registering resources with Prometheus monitoring", "running", mcp_server="infra", mcp_tool="infra_manage_prometheus_targets")
+            await self._register_with_prometheus(resources_created, apply_result.get("output_values", {}), logs)
+            if resources_created:
+                await _broadcast_step("prometheus_register", "Prometheus monitoring configured", "done", mcp_server="infra", mcp_tool="infra_manage_prometheus_targets")
 
             # Step 7: Update knowledge base
             logs.append("Updating knowledge base...")
+            await _broadcast_step("update_kb", "Saving to knowledge base for future reference", "running", mcp_server="gradient-ai", mcp_tool="query_agent")
             await self._update_knowledge_base(request, apply_result, cost_estimate)
+            await _broadcast_step("update_kb", "Knowledge base updated", "done", mcp_server="gradient-ai", mcp_tool="query_agent")
 
             duration = time.time() - start_time
             logs.append(f"✓ Provisioning completed in {duration:.1f} seconds")
@@ -216,7 +264,7 @@ class ProvisionerAgent(BaseAgent):
                 access_info=access_info,
                 cost_estimate=cost_estimate,
                 terraform_config=terraform_config,
-                terraform_outputs=apply_result.output_values,
+                terraform_outputs=apply_result.get("output_values", {}),
                 logs=logs,
                 duration_seconds=duration
             )
@@ -472,8 +520,16 @@ provider "aws" {{
 
         For Web Applications (Node.js, Python, etc.) on EC2:
         - Use aws_instance resource
-        - AMI for us-east-1: ami-0c02fb55b5c849e3f (Ubuntu 22.04 LTS)
-        - AMI for other regions: Use Ubuntu 22.04 LTS or Amazon Linux 2023
+        - CRITICAL: NEVER hardcode AMI IDs — they expire and vary by region. Always use a data source:
+          data "aws_ami" "ubuntu" {{
+            most_recent = true
+            owners      = ["099720109477"]  # Canonical
+            filter {{
+              name   = "name"
+              values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+            }}
+          }}
+          Then reference: ami = data.aws_ami.ubuntu.id
         - instance_type: t3.micro (small), t3.small (medium), t3.medium (larger)
         - Include user_data script to install dependencies and start the app
         - Create aws_security_group allowing HTTP (80), HTTPS (443), SSH (22)
@@ -515,7 +571,7 @@ provider "aws" {{
         - Create aws_route_table and aws_route_table_association
 
         IMPORTANT RULES:
-        1. CRITICAL: Use valid AMI ID for the region - ami-0c02fb55b5c849e3f for us-east-1 (Ubuntu 22.04)
+        1. CRITICAL: NEVER hardcode AMI IDs — always use data "aws_ami" lookup (see above)
         2. Always include meaningful outputs with resource IDs, IPs, DNS names
         3. Use tags on all resources: Name, Environment, ManagedBy
         4. Enable monitoring and backups for production (environment = "production")
@@ -548,7 +604,7 @@ provider "aws" {{
         }}
 
         resource "aws_instance" "example" {{
-          ami           = "ami-0c55b159cbfafe1f0"
+          ami           = data.aws_ami.ubuntu.id
           instance_type = "t3.micro"
           subnet_id     = tolist(data.aws_subnets.default.ids)[0]
           
@@ -702,69 +758,59 @@ provider "aws" {{
     def _extract_variables(self, request: ProvisionRequest, cloud_credentials: Optional[List] = None) -> Dict[str, Any]:
         """Extract Terraform variables from request and cloud credentials."""
         import os
-        
-        # Get the detected provider (set during _generate_terraform)
+
         detected_provider = getattr(self, '_detected_provider', 'digitalocean')
-        logger.info(f"🔍 _extract_variables called: detected_provider={detected_provider}, has_credentials={bool(cloud_credentials)}")
-        
+        logger.info(f"_extract_variables: detected_provider={detected_provider}, has_credentials={bool(cloud_credentials)}")
+
         variables = {
             "region": request.region,
             "environment": request.environment,
             "tags": request.tags
         }
-        
-        # Add default credentials based on detected provider
-        if detected_provider == "digitalocean":
-            variables["do_token"] = self.do_mcp.api_token
-            
-            # Add SSH key ID for automatic SSH access
-            ssh_key_id = os.getenv('SSH_KEY_ID')
-            if ssh_key_id:
-                variables["ssh_key_id"] = int(ssh_key_id)
-                logger.info(f"Added SSH key ID for autonomous remediation: {ssh_key_id}")
-            else:
-                logger.warning("SSH_KEY_ID not found in environment - new VMs won't have automatic SSH access")
 
-        # Extract credentials from cloud_credentials if provided
+        # Add default DO credentials from env (fallback)
+        variables["do_token"] = os.getenv("DIGITALOCEAN_API_TOKEN", "")
+        ssh_key_id = os.getenv('SSH_KEY_ID')
+        if ssh_key_id:
+            # Provide SSH key under all common variable names the AI might generate
+            variables["ssh_key_id"] = int(ssh_key_id)
+            variables["do_ssh_key"] = int(ssh_key_id)
+            variables["ssh_key"] = int(ssh_key_id)
+            variables["do_ssh_key_id"] = int(ssh_key_id)
+
+        # Extract credentials from ALL cloud_credentials in the project —
+        # the generated config may reference multiple providers
         if cloud_credentials:
             for cred in cloud_credentials:
                 provider = cred.provider if hasattr(cred, 'provider') else cred.get('provider')
                 credentials = cred.credentials if hasattr(cred, 'credentials') else cred.get('credentials', {})
-                
-                # Only extract variables for the detected provider
-                if provider != detected_provider:
-                    logger.debug(f"Skipping credentials for {provider}, detected provider is {detected_provider}")
-                    continue
-                
-                logger.info(f"Extracting credentials for detected provider: {provider}")
-                
+
+                logger.info(f"Extracting credentials for provider: {provider}")
+
                 if provider == "digitalocean":
                     if "api_token" in credentials:
                         variables["do_token"] = credentials["api_token"]
-                    variables["region"] = request.region
-                    
+
                 elif provider == "aws":
-                    # Add AWS credentials
                     if "access_key_id" in credentials:
                         variables["aws_access_key_id"] = credentials["access_key_id"]
                     if "secret_access_key" in credentials:
                         variables["aws_secret_access_key"] = credentials["secret_access_key"]
-                    
-                    # AWS region should come from AWS credential's region, not request.region
+
+                    # AWS region from credential or default
                     if hasattr(cred, 'region') and cred.region:
                         variables["aws_region"] = cred.region
-                    elif 'region' in cred if isinstance(cred, dict) else False:
+                    elif isinstance(cred, dict) and 'region' in cred:
                         variables["aws_region"] = cred['region']
                     else:
-                        # Default to us-east-1 if no region specified
                         variables["aws_region"] = "us-east-1"
-                    
+
                     logger.info(f"Using AWS region: {variables.get('aws_region')}")
 
         if request.template_params:
             variables.update(request.template_params)
 
-        logger.info(f"✅ Final variables: {list(variables.keys())}")
+        logger.info(f"Final variables: {list(variables.keys())}")
         return variables
 
     async def _extract_access_info(
@@ -802,44 +848,79 @@ provider "aws" {{
         """Parse created resources from Terraform apply result."""
         resources = []
 
-        # Extract from output values
-        if hasattr(apply_result, "output_values"):
-            outputs = apply_result.output_values
+        # Extract from output values (dict-based access for MCP results)
+        outputs = apply_result.get("output_values", {}) if isinstance(apply_result, dict) else getattr(apply_result, "output_values", {})
+        if outputs:
             
             # Parse different resource types from outputs
             for key, value in outputs.items():
                 key_lower = key.lower()
-                
-                # Droplet resources
-                if "droplet" in key_lower and ("id" in key_lower or key == "droplet_id"):
+
+                # --- AWS EC2 Instance ---
+                if "instance" in key_lower and ("id" in key_lower or key == "instance_id"):
+                    resources.append({
+                        "type": "ec2_instance",
+                        "provider": "aws",
+                        "id": value,
+                        "name": outputs.get("instance_name") or outputs.get("name") or f"instance-{value}",
+                        "ipv4_address": outputs.get("public_ip") or outputs.get("instance_ip"),
+                        "public_dns": outputs.get("public_dns") or outputs.get("instance_dns"),
+                    })
+
+                # --- AWS RDS ---
+                elif "db_instance" in key_lower and "id" in key_lower:
+                    resources.append({
+                        "type": "rds_instance",
+                        "provider": "aws",
+                        "id": value,
+                        "name": outputs.get("db_name") or f"rds-{value}",
+                        "host": outputs.get("db_endpoint") or outputs.get("db_address"),
+                    })
+
+                # --- AWS ALB / ELB ---
+                elif ("lb_" in key_lower or "alb_" in key_lower or "elb_" in key_lower) and ("arn" in key_lower or "dns" in key_lower):
+                    if not any(r.get("type") in ("alb", "elb") and r.get("provider") == "aws" for r in resources):
+                        resources.append({
+                            "type": "alb",
+                            "provider": "aws",
+                            "id": outputs.get("lb_arn") or value,
+                            "name": outputs.get("lb_name") or "load-balancer",
+                            "dns": outputs.get("lb_dns_name") or outputs.get("lb_dns") or value,
+                        })
+
+                # --- DigitalOcean Droplet ---
+                elif "droplet" in key_lower and ("id" in key_lower or key == "droplet_id"):
                     resources.append({
                         "type": "droplet",
+                        "provider": "digitalocean",
                         "id": value,
                         "name": outputs.get("droplet_name") or outputs.get("name") or f"droplet-{value}",
                         "ipv4_address": outputs.get("ipv4_address") or outputs.get("droplet_ip")
                     })
-                
-                # Database resources
+
+                # --- DO Database ---
                 elif "database" in key_lower and ("id" in key_lower or key == "database_id"):
                     resources.append({
                         "type": "database",
+                        "provider": "digitalocean",
                         "id": value,
                         "name": outputs.get("database_name") or f"database-{value}",
                         "host": outputs.get("database_host"),
                         "port": outputs.get("database_port"),
                         "connection_string": outputs.get("connection_string")
                     })
-                
-                # Load balancer resources
+
+                # --- DO Load Balancer ---
                 elif ("loadbalancer" in key_lower or "lb" in key_lower) and ("id" in key_lower or key == "lb_id"):
                     resources.append({
                         "type": "loadbalancer",
+                        "provider": "digitalocean",
                         "id": value,
                         "name": outputs.get("lb_name") or f"loadbalancer-{value}",
                         "ip": outputs.get("lb_ip") or outputs.get("loadbalancer_ip"),
                         "url": outputs.get("lb_url")
                     })
-                
+
                 # VPC resources
                 elif "vpc" in key_lower and "id" in key_lower:
                     resources.append({
@@ -848,8 +929,8 @@ provider "aws" {{
                         "name": outputs.get("vpc_name") or f"vpc-{value}",
                         "ip_range": outputs.get("vpc_ip_range")
                     })
-                
-                # Volume resources
+
+                # Volume / EBS resources
                 elif "volume" in key_lower and "id" in key_lower:
                     resources.append({
                         "type": "volume",
@@ -857,15 +938,16 @@ provider "aws" {{
                         "name": outputs.get("volume_name") or f"volume-{value}",
                         "size": outputs.get("volume_size")
                     })
-                
-                # Firewall resources
-                elif "firewall" in key_lower and "id" in key_lower:
+
+                # Firewall / Security Group resources
+                elif ("firewall" in key_lower or "security_group" in key_lower) and "id" in key_lower:
                     resources.append({
-                        "type": "firewall",
+                        "type": "firewall" if "firewall" in key_lower else "security_group",
+                        "provider": "aws" if "security_group" in key_lower else "digitalocean",
                         "id": value,
-                        "name": outputs.get("firewall_name") or f"firewall-{value}"
+                        "name": outputs.get("firewall_name") or outputs.get("sg_name") or f"firewall-{value}"
                     })
-                
+
                 # Generic ID detection (fallback)
                 elif key.endswith("_id") and not any(r.get("id") == value for r in resources):
                     resource_type = key.replace("_id", "")
@@ -874,20 +956,24 @@ provider "aws" {{
                         "id": value,
                         "name": outputs.get(f"{resource_type}_name") or f"{resource_type}-{value}"
                     })
-                
-                # IP addresses (likely droplets if not already parsed)
-                elif "ip" in key_lower and "address" in key_lower and value:
+
+                # IP addresses (likely droplets/instances if not already parsed)
+                elif "ip" in key_lower and ("address" in key_lower or key == "public_ip") and value:
                     if not any(r.get("ipv4_address") == value for r in resources):
+                        # Determine provider from context
+                        is_aws = any(k for k in outputs if "instance" in k.lower())
                         resources.append({
-                            "type": "droplet",
-                            "id": outputs.get("droplet_id") or outputs.get("id"),
-                            "name": outputs.get("droplet_name") or outputs.get("name") or "server",
+                            "type": "ec2_instance" if is_aws else "droplet",
+                            "provider": "aws" if is_aws else "digitalocean",
+                            "id": outputs.get("instance_id") or outputs.get("droplet_id") or outputs.get("id"),
+                            "name": outputs.get("instance_name") or outputs.get("droplet_name") or outputs.get("name") or "server",
                             "ipv4_address": value
                         })
 
         # If no specific resources found, create generic entries from resource count
-        if not resources and hasattr(apply_result, "resources_created") and apply_result.resources_created > 0:
-            for i in range(apply_result.resources_created):
+        created_count = apply_result.get("resources_created", 0) if isinstance(apply_result, dict) else getattr(apply_result, "resources_created", 0)
+        if not resources and created_count > 0:
+            for i in range(created_count):
                 resources.append({
                     "type": "resource",
                     "id": f"resource-{i+1}",
@@ -913,29 +999,73 @@ provider "aws" {{
         # Fix common typo: digitaldocean -> digitalocean
         config = config.replace('digitaldocean = {', 'digitalocean = {')
         config = config.replace('"digitaldocean"', '"digitalocean"')
+
+        # Remove ssh_key resources that use file() with local paths — these fail
+        # in headless environments. Rift provides SSH keys via variables instead.
+        import re
+        # Remove aws_key_pair and digitalocean_ssh_key resources that use file()
+        config = re.sub(
+            r'resource\s+"(aws_key_pair|digitalocean_ssh_key)"\s+"[^"]+"\s+\{[^}]*file\s*\([^)]*\)[^}]*\}\s*',
+            '', config, flags=re.DOTALL
+        )
+        # Remove dangling key_name/key_pair references to the deleted resources
+        config = re.sub(r'\n\s*key_name\s*=\s*aws_key_pair\.[^\n]+', '', config)
+        # Replace any remaining file("~/.ssh/...") calls with empty string
+        config = re.sub(r'file\s*\(\s*"[^"]*\.ssh[^"]*"\s*\)', '""', config)
         
         # Fix AWS-specific issues
         import re
         
         # CRITICAL FIX: Remove slow data sources for VPC and subnets
-        # These queries take forever - AWS has default VPC, no need to query
+        # These queries take forever — AWS has default VPC, no need to query
         if 'data "aws_vpc"' in config or 'data "aws_subnets"' in config:
             # Remove data source blocks (including nested blocks)
-            # Match multi-line blocks with nested filter blocks
             config = re.sub(r'data\s+"aws_vpc"\s+"[^"]+"\s+\{[^}]*\}\s*', '', config, flags=re.DOTALL)
             config = re.sub(r'data\s+"aws_subnets"\s+"[^"]+"\s+\{(?:[^{}]|\{[^}]*\})*\}\s*', '', config, flags=re.DOTALL)
-            
-            # Remove vpc_id references from security groups (works without it in default VPC)
-            config = re.sub(r'\n\s*vpc_id\s*=\s*data\.aws_vpc\.[^\n]+', '', config)
-            
-            # Remove subnet_id references from instances (use default subnet automatically)
-            # Keep the newline character
-            config = re.sub(r'\n\s*subnet_id\s*=\s*tolist\(data\.aws_subnets[^\n]+', '', config)
-            config = re.sub(r'\n\s*subnet_id\s*=\s*data\.aws_subnets[^\n]+', '', config)
-            
+
+            # Remove ALL lines referencing the removed data sources
+            config = re.sub(r'\n\s*[a-z_]+\s*=\s*data\.aws_vpc\.[^\n]+', '', config)
+            config = re.sub(r'\n\s*[a-z_]+\s*=\s*\[?\s*data\.aws_vpc\.[^\n]+', '', config)
+            config = re.sub(r'\n\s*[a-z_]+\s*=\s*tolist\(data\.aws_subnets[^\n]+', '', config)
+            config = re.sub(r'\n\s*[a-z_]+\s*=\s*\[?\s*data\.aws_subnets[^\n]+', '', config)
+            # Also catch references inside expressions like [data.aws_vpc.default.id]
+            config = re.sub(r'\n\s*[a-z_]+\s*=\s*\[[^\]]*data\.aws_(vpc|subnets)\.[^\]]*\][^\n]*', '', config)
+
+            # Remove any aws_db_subnet_group that references the removed subnets
+            if 'data.aws_subnets' not in config and 'aws_db_subnet_group' in config:
+                config = re.sub(
+                    r'resource\s+"aws_db_subnet_group"\s+"[^"]+"\s+\{(?:[^{}]|\{[^}]*\})*\}\s*',
+                    '', config, flags=re.DOTALL
+                )
+                # Remove db_subnet_group_name refs that pointed to the deleted resource
+                config = re.sub(r'\n\s*db_subnet_group_name\s*=\s*aws_db_subnet_group\.[^\n]+', '', config)
+
             # Clean up multiple blank lines
             config = re.sub(r'\n\s*\n\s*\n+', '\n\n', config)
         
+        # Fix hardcoded AMI IDs — replace with dynamic data source lookup
+        hardcoded_ami = re.search(r'ami\s*=\s*"(ami-[a-f0-9]+)"', config)
+        if hardcoded_ami and 'data "aws_ami"' not in config:
+            ami_data_block = '''
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+}
+'''
+            # Insert after the provider block
+            provider_match = re.search(r'(provider\s+"aws"\s+\{[^}]*\})', config, re.DOTALL)
+            if provider_match:
+                insert_pos = provider_match.end()
+                config = config[:insert_pos] + '\n' + ami_data_block + config[insert_pos:]
+
+            # Replace all hardcoded AMI references
+            config = re.sub(r'ami\s*=\s*"ami-[a-f0-9]+"', 'ami = data.aws_ami.ubuntu.id', config)
+
         # Fix deprecated aws_subnet_ids -> aws_subnets (if any remain)
         config = config.replace('data "aws_subnet_ids"', 'data "aws_subnets"')
         config = config.replace('data.aws_subnet_ids', 'data.aws_subnets')
@@ -1032,9 +1162,13 @@ provider "aws" {{
         if not response:
             logger.warning("Empty response received for Terraform extraction")
             return ""
-            
+
         config = response.strip()
         logger.debug(f"Extracting Terraform from response of length {len(config)}")
+
+        # Strip <think>...</think> reasoning blocks (DeepSeek models)
+        import re
+        config = re.sub(r'<think>.*?</think>', '', config, flags=re.DOTALL).strip()
 
         # If response contains markdown code blocks
         if "```" in config:
@@ -1081,72 +1215,61 @@ provider "aws" {{
         logs: List[str]
     ):
         """
-        Automatically register newly created droplets with Prometheus
-        
+        Automatically register newly created droplets with Prometheus via MCP.
+
         Args:
             resources_created: List of created resources
             outputs: Terraform output values
             logs: Provisioning logs to append to
         """
         try:
-            import os
-            
-            # Get control plane IP from environment
-            control_plane_ip = os.getenv('CONTROL_PLANE_IP', '104.236.4.131')
-            
-            if not control_plane_ip:
-                logger.warning("CONTROL_PLANE_IP not set, skipping Prometheus registration")
-                return
-            
-            # Initialize Prometheus manager if not already done
-            if not self.prometheus_manager:
-                self.prometheus_manager = PrometheusConfigManager(control_plane_ip)
-            
             # Find droplets in created resources
             droplets_to_register = []
-            
+
             for resource in resources_created:
                 if resource.get('type') == 'droplet' or 'droplet' in resource.get('name', '').lower():
                     droplet_name = resource.get('name', 'unknown')
                     droplet_ip = None
-                    
+
                     # Try to get IP from outputs
                     for key, value in outputs.items():
                         if 'ip' in key.lower() and droplet_name.lower() in key.lower():
                             droplet_ip = value
                             break
-                    
+
                     # Fallback: check generic ip output keys
                     if not droplet_ip:
                         droplet_ip = outputs.get('ipv4_address') or outputs.get('ip_address') or outputs.get('public_ip')
-                    
+
                     if droplet_ip:
                         droplets_to_register.append({
                             'name': droplet_name,
                             'ip': droplet_ip
                         })
-            
-            # Register each droplet with Prometheus
+
+            # Register each droplet with Prometheus via infra MCP server
             for droplet in droplets_to_register:
-                logs.append(f"Registering {droplet['name']} with Prometheus...")
-                
-                success = await self.prometheus_manager.add_target(
-                    job_name=droplet['name'],
-                    target_ip=droplet['ip'],
-                    target_port=9100,
-                    labels={'managed_by': 'rift'}
-                )
-                
-                if success:
+                logs.append(f"Registering {droplet['name']} with Prometheus via MCP...")
+
+                result = await self.call_mcp("infra", "infra_manage_prometheus_targets", {
+                    "action": "add",
+                    "job_name": droplet['name'],
+                    "target_ip": droplet['ip'],
+                    "target_port": 9100,
+                    "labels": {"managed_by": "rift"}
+                })
+
+                if result.get("success"):
                     logs.append(f"✓ {droplet['name']} registered for monitoring at {droplet['ip']}:9100")
-                    logger.info(f"Registered {droplet['name']} ({droplet['ip']}) with Prometheus")
+                    logger.info(f"Registered {droplet['name']} ({droplet['ip']}) with Prometheus via MCP")
                 else:
-                    logs.append(f"⚠ Failed to register {droplet['name']} with Prometheus (will need manual setup)")
-                    logger.warning(f"Failed to register {droplet['name']} with Prometheus")
-            
+                    error = result.get("error", "unknown error")
+                    logs.append(f"⚠ Failed to register {droplet['name']} with Prometheus: {error}")
+                    logger.warning(f"Failed to register {droplet['name']} with Prometheus: {error}")
+
             if not droplets_to_register:
                 logger.debug("No droplets found to register with Prometheus")
-                
+
         except Exception as e:
             logger.error(f"Failed to register with Prometheus: {str(e)}", exc_info=True)
             logs.append(f"⚠ Prometheus registration failed: {str(e)}")
@@ -1168,10 +1291,10 @@ provider "aws" {{
             Region: {request.region}
 
             Result:
-            - Resources Created: {apply_result.resources_created}
-            - Resources Updated: {apply_result.resources_updated}
+            - Resources Created: {apply_result.get("resources_created", 0) if isinstance(apply_result, dict) else getattr(apply_result, "resources_created", 0)}
+            - Resources Updated: {apply_result.get("resources_updated", 0) if isinstance(apply_result, dict) else getattr(apply_result, "resources_updated", 0)}
             - Monthly Cost: ${cost:.2f}
-            - Duration: {apply_result.duration_seconds}s
+            - Duration: {apply_result.get("duration_seconds", 0) if isinstance(apply_result, dict) else getattr(apply_result, "duration_seconds", 0)}s
 
             This provisioning was successful and can be used as a reference
             for similar infrastructure requests.

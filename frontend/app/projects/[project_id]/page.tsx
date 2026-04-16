@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react"
 import Link from "next/link"
 import { useParams, useRouter } from "next/navigation"
-import { ArrowLeft, Edit, Trash2, Activity, AlertTriangle, DollarSign, Server, Eye, Zap, RefreshCw } from "lucide-react"
+import { ArrowLeft, Edit, Trash2, Activity, AlertTriangle, DollarSign, Server, Eye, Zap, RefreshCw, Loader2, Flame } from "lucide-react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -51,6 +51,7 @@ export default function ProjectDetailsPage() {
   const [project, setProject] = useState<Project | null>(null)
   const [incidents, setIncidents] = useState<Incident[]>([])
   const [loading, setLoading] = useState(true)
+  const [destroyingInfra, setDestroyingInfra] = useState(false)
 
   useEffect(() => {
     if (projectId) {
@@ -102,6 +103,38 @@ export default function ProjectDetailsPage() {
     } catch (error) {
       console.error("Failed to delete project:", error)
       alert("Failed to delete project")
+    }
+  }
+
+  const handleDestroyInfrastructure = async () => {
+    if (!confirm(
+      `Are you sure you want to destroy ALL infrastructure for "${project?.name}"?\n\n` +
+      `This will run terraform destroy and permanently remove all provisioned resources ` +
+      `(droplets, databases, load balancers, etc.) from your cloud provider.\n\n` +
+      `This action cannot be undone.`
+    )) {
+      return
+    }
+
+    setDestroyingInfra(true)
+    try {
+      const response = await fetch(`${API_URL}/projects/${projectId}/infrastructure`, {
+        method: "DELETE",
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        alert(`Infrastructure destroyed successfully.\n\n${data.message}`)
+        fetchProjectDetails() // Refresh to show empty resources
+      } else {
+        const errorData = await response.json().catch(() => ({ detail: "Unknown error" }))
+        alert(`Failed to destroy infrastructure: ${errorData.detail || "Unknown error"}`)
+      }
+    } catch (error) {
+      console.error("Failed to destroy infrastructure:", error)
+      alert("Failed to destroy infrastructure. Check console for details.")
+    } finally {
+      setDestroyingInfra(false)
     }
   }
 
@@ -222,13 +255,33 @@ export default function ProjectDetailsPage() {
                   Provision Resources
                 </Button>
               </Link>
+              {project.resources.length > 0 && (
+                <Button
+                  variant="outline"
+                  className="bg-orange-600/20 border-orange-500/50 text-orange-400 hover:bg-orange-600/30"
+                  onClick={handleDestroyInfrastructure}
+                  disabled={destroyingInfra}
+                >
+                  {destroyingInfra ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      Destroying...
+                    </>
+                  ) : (
+                    <>
+                      <Flame className="w-4 h-4 mr-2" />
+                      Destroy Infrastructure
+                    </>
+                  )}
+                </Button>
+              )}
               <Button
                 variant="outline"
                 className="bg-red-600/20 border-red-500/50 text-red-400 hover:bg-red-600/30"
                 onClick={handleDelete}
               >
                 <Trash2 className="w-4 h-4 mr-2" />
-                Delete
+                Delete Project
               </Button>
             </div>
           </div>
@@ -387,15 +440,48 @@ export default function ProjectDetailsPage() {
                   {project.total_resources} total resources
                 </CardDescription>
               </div>
-              <Link href={`/provision?project=${projectId}`}>
-                <Button className="bg-blue-600 hover:bg-blue-700 text-white">
-                  <Zap className="w-4 h-4 mr-2" />
-                  Provision New
-                </Button>
-              </Link>
+              <div className="flex gap-2">
+                {project.resources.length > 0 && (
+                  <Button
+                    variant="outline"
+                    className="bg-red-600/20 border-red-500/50 text-red-400 hover:bg-red-600/30"
+                    onClick={handleDestroyInfrastructure}
+                    disabled={destroyingInfra}
+                  >
+                    {destroyingInfra ? (
+                      <>
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                        Destroying...
+                      </>
+                    ) : (
+                      <>
+                        <Trash2 className="w-4 h-4 mr-2" />
+                        Destroy All
+                      </>
+                    )}
+                  </Button>
+                )}
+                <Link href={`/provision?project=${projectId}`}>
+                  <Button className="bg-blue-600 hover:bg-blue-700 text-white">
+                    <Zap className="w-4 h-4 mr-2" />
+                    Provision New
+                  </Button>
+                </Link>
+              </div>
             </div>
           </CardHeader>
           <CardContent>
+            {destroyingInfra && (
+              <div className="mb-4 p-4 bg-orange-900/30 border border-orange-500/50 rounded-lg">
+                <div className="flex items-center gap-3">
+                  <Loader2 className="w-5 h-5 text-orange-400 animate-spin" />
+                  <div>
+                    <div className="text-orange-300 font-medium">Destroying infrastructure...</div>
+                    <div className="text-orange-400/70 text-sm">Running terraform destroy. This may take a few minutes.</div>
+                  </div>
+                </div>
+              </div>
+            )}
             {project.resources.length === 0 ? (
               <div className="text-center py-12">
                 <Server className="w-16 h-16 text-gray-600 mx-auto mb-4" />
@@ -416,16 +502,32 @@ export default function ProjectDetailsPage() {
                     className="p-4 bg-gray-900/50 rounded-lg border border-gray-700 hover:border-gray-600 transition-colors"
                   >
                     <div className="flex items-center justify-between">
-                      <div>
+                      <div className="flex-1">
                         <div className="text-white font-medium">{resource.name}</div>
-                        <div className="text-gray-400 text-sm">{resource.type}</div>
+                        <div className="flex items-center gap-3 mt-1">
+                          <span className="text-gray-400 text-sm">{resource.type}</span>
+                          {resource.provider && (
+                            <span className="text-gray-500 text-xs">{resource.provider}</span>
+                          )}
+                          {resource.region && (
+                            <span className="text-gray-500 text-xs">{resource.region}</span>
+                          )}
+                          {resource.ipv4_address && (
+                            <span className="text-cyan-400/70 text-xs font-mono">{resource.ipv4_address}</span>
+                          )}
+                        </div>
                       </div>
-                      <Badge variant="outline" className={getStatusColor(resource.status || "active")}>
-                        {resource.status || "active"}
-                      </Badge>
+                      <div className="flex items-center gap-2">
+                        <Badge variant="outline" className={getStatusColor(resource.status || "active")}>
+                          {resource.status || "active"}
+                        </Badge>
+                      </div>
                     </div>
                   </div>
                 ))}
+                <div className="pt-2 text-xs text-gray-500">
+                  Resources are managed by Terraform. Use &quot;Destroy All&quot; to run <code className="text-gray-400">terraform destroy</code> and remove all resources from your cloud provider.
+                </div>
               </div>
             )}
           </CardContent>

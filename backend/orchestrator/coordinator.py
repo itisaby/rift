@@ -40,7 +40,8 @@ class Coordinator:
         remediation_agent: RemediationAgent,
         confidence_threshold: float = 0.85,
         auto_remediation_enabled: bool = True,
-        check_interval: int = 30
+        check_interval: int = 30,
+        drift_detector=None
     ):
         """
         Initialize Coordinator.
@@ -52,6 +53,7 @@ class Coordinator:
             confidence_threshold: Minimum confidence for auto-remediation
             auto_remediation_enabled: Whether to auto-remediate
             check_interval: Seconds between infrastructure checks
+            drift_detector: Optional DriftDetector for periodic drift checks
         """
         self.monitor_agent = monitor_agent
         self.diagnostic_agent = diagnostic_agent
@@ -60,7 +62,8 @@ class Coordinator:
         self.confidence_threshold = confidence_threshold
         self.auto_remediation_enabled = auto_remediation_enabled
         self.check_interval = check_interval
-        
+        self.drift_detector = drift_detector
+
         # WebSocket connection manager (set after initialization)
         self.connection_manager: Optional[Any] = None
 
@@ -98,10 +101,12 @@ class Coordinator:
         4. Learns from outcomes
         """
         self.running = True
+        iteration = 0
         logger.info("autonomous_loop_started", message="Starting autonomous infrastructure monitoring")
 
         try:
             while self.running:
+                iteration += 1
                 try:
                     # Check for new incidents
                     logger.debug("checking_infrastructure", message="Running infrastructure health check")
@@ -121,6 +126,10 @@ class Coordinator:
 
                     else:
                         logger.debug("no_incidents", message="No incidents detected")
+
+                    # Drift detection every 10th iteration (~5 min at 30s interval)
+                    if self.drift_detector and iteration % 10 == 0:
+                        await self._run_drift_detection()
 
                 except Exception as e:
                     logger.error(
@@ -148,6 +157,50 @@ class Coordinator:
         """Stop the autonomous loop."""
         logger.info("stopping_autonomous_loop", message="Stopping autonomous loop")
         self.running = False
+
+    async def _run_drift_detection(self):
+        """Run drift detection across all projects and auto-reconcile."""
+        try:
+            logger.info("drift_check_started", message="Running drift detection for all projects")
+            drift_results = await self.drift_detector.check_all_projects()
+
+            for result in drift_results:
+                if not result.has_drift:
+                    continue
+
+                logger.warning(
+                    "drift_detected",
+                    project_id=result.project_id,
+                    resources_to_add=result.resources_to_add,
+                    message=f"Drift detected in project {result.project_id}: {result.resources_to_add} resource(s) missing"
+                )
+
+                reconcile_result = await self.drift_detector.reconcile(result.project_id)
+
+                if self.connection_manager:
+                    await self.connection_manager.broadcast({
+                        "type": "drift_detected_and_reconciled",
+                        "project_id": result.project_id,
+                        "resources_to_add": result.resources_to_add,
+                        "reconciled": reconcile_result.success,
+                        "resources_created": reconcile_result.resources_created,
+                    })
+
+                if reconcile_result.success:
+                    logger.info(
+                        "drift_reconciled",
+                        project_id=result.project_id,
+                        resources_created=reconcile_result.resources_created,
+                    )
+                else:
+                    logger.error(
+                        "drift_reconcile_failed",
+                        project_id=result.project_id,
+                        error=reconcile_result.error,
+                    )
+
+        except Exception as e:
+            logger.error("drift_detection_error", error=str(e), message=f"Drift detection failed: {e}")
 
     async def handle_incident_workflow(self, incident: Incident) -> Optional[RemediationResult]:
         """

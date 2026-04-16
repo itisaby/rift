@@ -8,7 +8,12 @@ import asyncio
 import sys
 sys.path.insert(0, '.')
 
-from utils.prometheus_config import PrometheusConfigManager
+# PrometheusConfigManager has been replaced by the infra MCP server.
+# This test is now deprecated. Use the infra MCP server's
+# infra_manage_prometheus_targets tool instead.
+print("DEPRECATED: This test uses the old PrometheusConfigManager which has been replaced by the infra MCP server.")
+print("Use the infra MCP server's infra_manage_prometheus_targets tool instead.")
+import sys; sys.exit(0)
 
 
 async def test_prometheus_registration():

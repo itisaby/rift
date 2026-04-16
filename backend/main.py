@@ -43,16 +43,17 @@ from utils.config import get_settings
 from utils.logger import setup_logging, get_logger
 
 # Import agents and coordinator
+import sys
+
 from agents.monitor_agent import MonitorAgent
 from agents.diagnostic_agent import DiagnosticAgent
 from agents.remediation_agent import RemediationAgent
 from agents.provisioner_agent import ProvisionerAgent
 from agents.safety_validator import SafetyValidator
-from mcp_clients.do_mcp import DigitalOceanMCP
-from mcp_clients.prometheus_mcp import PrometheusMCP
-from mcp_clients.terraform_mcp import TerraformMCP
+from mcp_session.session_manager import MCPSessionManager
 from orchestrator.coordinator import Coordinator
 from services.project_service import ProjectService
+from services.drift_detector import DriftDetector
 
 # Initialize settings and logging
 settings = get_settings()
@@ -63,32 +64,101 @@ setup_logging(
 logger = get_logger(__name__)
 
 
+def _ensure_prometheus_config():
+    """Create Prometheus config directory and initial config if they don't exist."""
+    from pathlib import Path
+    config_path = Path(os.getenv("PROMETHEUS_CONFIG_PATH", "/tmp/rift_prometheus/prometheus.yml"))
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if not config_path.exists():
+        config_path.write_text(
+            "global:\n"
+            "  scrape_interval: 15s\n"
+            "  evaluation_interval: 15s\n"
+            "scrape_configs:\n"
+            "  - job_name: prometheus\n"
+            "    static_configs:\n"
+            "      - targets:\n"
+            "          - localhost:9090\n"
+        )
+        logger.info(f"Created initial Prometheus config at {config_path}")
+
+
 # Global state for agents and coordinator
 async def initialize_system():
     """Initialize all agents and the coordinator"""
     logger.info("Initializing Rift system...")
 
-    # Initialize MCP clients
-    do_mcp = DigitalOceanMCP(api_token=os.getenv("DIGITALOCEAN_API_TOKEN"))
-    prometheus_mcp = PrometheusMCP(
-        prometheus_url=os.getenv("PROMETHEUS_URL"),
-        username=os.getenv("PROMETHEUS_USER"),
-        password=os.getenv("PROMETHEUS_PASSWORD")
+    # Initialize MCP Session Manager
+    mcp_manager = MCPSessionManager()
+
+    # Resolve the Python executable for subprocess launching
+    python_exe = sys.executable
+
+    # Register all 5 MCP servers
+    mcp_manager.register(
+        name="do",
+        command=python_exe,
+        args=["mcp_servers/do_server.py"],
+        env={"DIGITALOCEAN_API_TOKEN": os.getenv("DIGITALOCEAN_API_TOKEN", "")},
     )
-    terraform_mcp = TerraformMCP(working_dir="/tmp/rift_terraform")
+    mcp_manager.register(
+        name="terraform",
+        command=python_exe,
+        args=["mcp_servers/terraform_server.py"],
+        env={
+            "TF_WORKING_DIR": os.getenv("TF_WORKING_DIR", "/tmp/rift_terraform"),
+            "TF_BINARY": os.getenv("TF_BINARY", "terraform"),
+        },
+    )
+    mcp_manager.register(
+        name="prometheus",
+        command=python_exe,
+        args=["mcp_servers/prometheus_server.py"],
+        env={
+            "PROMETHEUS_URL": os.getenv("PROMETHEUS_URL", "http://localhost:9090"),
+            "PROMETHEUS_USER": os.getenv("PROMETHEUS_USER", ""),
+            "PROMETHEUS_PASSWORD": os.getenv("PROMETHEUS_PASSWORD", ""),
+        },
+    )
+    mcp_manager.register(
+        name="aws",
+        command=python_exe,
+        args=["mcp_servers/aws_server.py"],
+        env={
+            "AWS_ACCESS_KEY_ID": os.getenv("AWS_ACCESS_KEY_ID", ""),
+            "AWS_SECRET_ACCESS_KEY": os.getenv("AWS_SECRET_ACCESS_KEY", ""),
+            "AWS_DEFAULT_REGION": os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+        },
+    )
+    mcp_manager.register(
+        name="infra",
+        command=python_exe,
+        args=["mcp_servers/infra_server.py"],
+        env={
+            "PROMETHEUS_CONFIG_PATH": os.getenv("PROMETHEUS_CONFIG_PATH", "/tmp/rift_prometheus/prometheus.yml"),
+            "PROMETHEUS_CONTAINER_NAME": os.getenv("PROMETHEUS_CONTAINER_NAME", "rift-prometheus"),
+            "PROMETHEUS_URL": os.getenv("PROMETHEUS_URL", "http://localhost:9090"),
+            "SSH_DEFAULT_KEY_PATH": os.path.expanduser("~/.ssh/id_ed25519_do_rift"),
+        },
+    )
+
+    # Ensure Prometheus config directory and initial config exist
+    _ensure_prometheus_config()
+
+    # Start all MCP server subprocesses
+    await mcp_manager.start_all()
 
     # Initialize safety validator
     safety_validator = SafetyValidator(
         auto_approve_threshold=float(os.getenv("MAX_COST_AUTO_APPROVE", "50.0"))
     )
 
-    # Initialize agents
+    # Initialize agents with mcp_manager
     monitor_agent = MonitorAgent(
         agent_endpoint=os.getenv("MONITOR_AGENT_ENDPOINT"),
         agent_key=os.getenv("MONITOR_AGENT_KEY"),
         agent_id=os.getenv("MONITOR_AGENT_ID"),
-        do_mcp=do_mcp,
-        prometheus_mcp=prometheus_mcp,
+        mcp_manager=mcp_manager,
         knowledge_base_id=os.getenv("KNOWLEDGE_BASE_ID")
     )
 
@@ -97,17 +167,15 @@ async def initialize_system():
         agent_key=os.getenv("DIAGNOSTIC_AGENT_KEY"),
         agent_id=os.getenv("DIAGNOSTIC_AGENT_ID"),
         knowledge_base_id=os.getenv("KNOWLEDGE_BASE_ID"),
-        terraform_mcp=terraform_mcp,
-        do_mcp=do_mcp
+        mcp_manager=mcp_manager
     )
 
     remediation_agent = RemediationAgent(
         agent_endpoint=os.getenv("REMEDIATION_AGENT_ENDPOINT"),
         agent_key=os.getenv("REMEDIATION_AGENT_KEY"),
         agent_id=os.getenv("REMEDIATION_AGENT_ID"),
-        terraform_mcp=terraform_mcp,
-        do_mcp=do_mcp,
         safety_validator=safety_validator,
+        mcp_manager=mcp_manager,
         knowledge_base_id=os.getenv("KNOWLEDGE_BASE_ID")
     )
 
@@ -115,36 +183,38 @@ async def initialize_system():
         agent_endpoint=os.getenv("PROVISIONER_AGENT_ENDPOINT"),
         agent_key=os.getenv("PROVISIONER_AGENT_KEY"),
         agent_id=os.getenv("PROVISIONER_AGENT_ID"),
-        terraform_mcp=terraform_mcp,
-        do_mcp=do_mcp,
+        mcp_manager=mcp_manager,
         knowledge_base_id=os.getenv("KNOWLEDGE_BASE_ID")
     )
+
+    # Initialize project service
+    project_service = ProjectService(storage_path="./data/projects")
+
+    # Initialize drift detector
+    drift_detector = DriftDetector(mcp_manager=mcp_manager, project_service=project_service)
 
     # Initialize coordinator
     coordinator = Coordinator(
         monitor_agent=monitor_agent,
         diagnostic_agent=diagnostic_agent,
         remediation_agent=remediation_agent,
-        confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.85")),
+        confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.70")),
         auto_remediation_enabled=os.getenv("AUTO_REMEDIATION_ENABLED", "true").lower() == "true",
-        check_interval=30
+        check_interval=30,
+        drift_detector=drift_detector
     )
 
-    # Initialize project service
-    project_service = ProjectService(storage_path="./data/projects")
-
     # Store in app state
-    app.state.do_mcp = do_mcp
-    app.state.prometheus_mcp = prometheus_mcp
-    app.state.terraform_mcp = terraform_mcp
+    app.state.mcp_manager = mcp_manager
     app.state.monitor_agent = monitor_agent
     app.state.diagnostic_agent = diagnostic_agent
     app.state.remediation_agent = remediation_agent
     app.state.provisioner_agent = provisioner_agent
     app.state.coordinator = coordinator
     app.state.project_service = project_service
+    app.state.drift_detector = drift_detector
     app.state.connection_manager = ConnectionManager()
-    
+
     # Set connection manager on coordinator for WebSocket broadcasts
     coordinator.connection_manager = app.state.connection_manager
 
@@ -163,12 +233,8 @@ async def cleanup_system():
         await app.state.remediation_agent.close()
     if hasattr(app.state, 'provisioner_agent'):
         await app.state.provisioner_agent.close()
-    if hasattr(app.state, 'do_mcp'):
-        await app.state.do_mcp.close()
-    if hasattr(app.state, 'prometheus_mcp'):
-        await app.state.prometheus_mcp.close()
-    if hasattr(app.state, 'terraform_mcp'):
-        app.state.terraform_mcp.cleanup()
+    if hasattr(app.state, 'mcp_manager'):
+        await app.state.mcp_manager.stop_all()
 
     logger.info("✓ Cleanup complete")
 
@@ -584,23 +650,33 @@ async def provision_infrastructure(request: ProvisionRequest, project_id: str = 
                 logger.info("provision_with_project_credentials", project_id=project_id,
                            providers=[cp.provider for cp in cloud_credentials])
         
-        # Execute provisioning
-        result = await app.state.provisioner_agent.provision(request, cloud_credentials=cloud_credentials)
+        # Execute provisioning with real-time WebSocket broadcasting
+        result = await app.state.provisioner_agent.provision(
+            request,
+            cloud_credentials=cloud_credentials,
+            project_id=project_id,
+            broadcast_fn=app.state.connection_manager.broadcast
+        )
 
         # If provisioning succeeded and project_id provided, add resources to project
         if result.success and project_id and hasattr(app.state, 'project_service'):
             for resource in result.resources_created or []:
+                # Detect provider from resource data or fall back to detected provider
+                provider = resource.get("provider") or getattr(
+                    app.state.provisioner_agent, '_detected_provider', 'digitalocean'
+                )
                 resource_data = {
                     "id": resource.get("id"),
                     "name": resource.get("name"),
                     "type": resource.get("type", "unknown"),
-                    "provider": "digitalocean",
+                    "provider": provider,
                     "status": "active",
                     "region": request.region or "nyc3",
                     "cost_per_month": result.cost_estimate / len(result.resources_created) if result.resources_created else 0,
                     "created_at": resource.get("created_at"),
                     "tags": request.tags or [],
-                    "dependencies": resource.get("dependencies", [])
+                    "dependencies": resource.get("dependencies", []),
+                    "ipv4_address": resource.get("ipv4_address") or resource.get("public_dns"),
                 }
                 await app.state.project_service.add_resource(project_id, resource_data)
             
@@ -814,17 +890,97 @@ async def update_project(project_id: str, request: UpdateProjectRequest):
     return project
 
 
-@app.delete("/projects/{project_id}")
-async def delete_project(project_id: str):
-    """Delete a project"""
+@app.delete("/projects/{project_id}/infrastructure")
+async def destroy_project_infrastructure(project_id: str):
+    """Destroy infrastructure for a project via terraform destroy, then clean up."""
     if not hasattr(app.state, 'project_service'):
         raise HTTPException(status_code=503, detail="Project service not initialized")
-    
+    if not hasattr(app.state, 'mcp_manager'):
+        raise HTTPException(status_code=503, detail="MCP manager not initialized")
+
+    project = await app.state.project_service.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    tf_dir = os.path.join(".", "data", "terraform", project_id)
+    results = {"terraform_destroy": False, "cleanup": False}
+
+    # Run terraform destroy if state exists
+    from pathlib import Path as _Path
+    if _Path(tf_dir).exists() and (_Path(tf_dir) / "terraform.tfstate").exists():
+        try:
+            destroy_result = await app.state.mcp_manager.call("terraform", "terraform_destroy", {
+                "auto_approve": True,
+                "working_dir": tf_dir,
+            })
+            results["terraform_destroy"] = bool(destroy_result)
+        except Exception as e:
+            logger.error(f"Terraform destroy failed for project {project_id}: {e}")
+            results["terraform_destroy_error"] = str(e)
+
+    # Clean up terraform directory
+    import shutil
+    if _Path(tf_dir).exists():
+        shutil.rmtree(tf_dir, ignore_errors=True)
+        results["cleanup"] = True
+
+    # Remove Prometheus targets for project resources
+    for resource in (project.resources or []):
+        ip = resource.get("ipv4_address") if isinstance(resource, dict) else getattr(resource, "ipv4_address", None)
+        name = resource.get("name") if isinstance(resource, dict) else getattr(resource, "name", None)
+        if name:
+            try:
+                await app.state.mcp_manager.call("infra", "infra_manage_prometheus_targets", {
+                    "action": "remove",
+                    "job_name": name,
+                })
+            except Exception:
+                pass
+
+    # Clear project resources
+    project.resources = []
+    await app.state.project_service.update_project_stats(project_id)
+
+    # Broadcast event
+    if hasattr(app.state, 'connection_manager'):
+        await app.state.connection_manager.broadcast({
+            "type": "infrastructure_destroyed",
+            "project_id": project_id,
+        })
+
+    return {"message": "Infrastructure destroyed", "details": results}
+
+
+@app.delete("/projects/{project_id}")
+async def delete_project(project_id: str):
+    """Delete a project, destroying its infrastructure first."""
+    if not hasattr(app.state, 'project_service'):
+        raise HTTPException(status_code=503, detail="Project service not initialized")
+
+    project = await app.state.project_service.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Destroy infrastructure first (best-effort)
+    try:
+        tf_dir = os.path.join(".", "data", "terraform", project_id)
+        from pathlib import Path as _Path
+        if _Path(tf_dir).exists() and (_Path(tf_dir) / "terraform.tfstate").exists():
+            await app.state.mcp_manager.call("terraform", "terraform_destroy", {
+                "auto_approve": True,
+                "working_dir": tf_dir,
+            })
+        import shutil
+        if _Path(tf_dir).exists():
+            shutil.rmtree(tf_dir, ignore_errors=True)
+    except Exception as e:
+        logger.warning(f"Infrastructure cleanup failed for project {project_id}: {e}")
+
     success = await app.state.project_service.delete_project(project_id)
     if not success:
         raise HTTPException(status_code=404, detail="Project not found")
-    
-    return {"message": "Project deleted successfully"}
+
+    return {"message": "Project and infrastructure deleted successfully"}
 
 
 @app.post("/projects/{project_id}/sync-resources")
@@ -833,21 +989,21 @@ async def sync_project_resources(project_id: str):
     if not hasattr(app.state, 'project_service'):
         raise HTTPException(status_code=503, detail="Project service not initialized")
     
-    if not hasattr(app.state, 'do_mcp'):
-        raise HTTPException(status_code=503, detail="DigitalOcean MCP not initialized")
-    
+    if not hasattr(app.state, 'mcp_manager'):
+        raise HTTPException(status_code=503, detail="MCP manager not initialized")
+
     try:
         project = await app.state.project_service.get_project(project_id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
-        
+
         # Find droplets with project tags
         project_tags = project.tags + ["frontend-provisioned"]  # Include common tags
         droplets = []
-        
+
         for tag in project_tags:
             try:
-                tagged_droplets = await app.state.do_mcp.list_droplets(tag=tag)
+                tagged_droplets = await app.state.mcp_manager.call("do", "list_droplets", {"tag": tag})
                 droplets.extend(tagged_droplets)
             except:
                 pass
@@ -888,9 +1044,38 @@ async def sync_project_resources(project_id: str):
             await app.state.project_service.add_resource(project_id, resource_data)
         
         await app.state.project_service.update_project_stats(project_id)
-        
+
+        # Sync Prometheus targets: remove stale ones, keep only live droplet IPs
+        live_ips = set()
+        for droplet in unique_droplets:
+            networks = droplet.get("networks", {}).get("v4", [])
+            for network in networks:
+                if network.get("type") == "public":
+                    live_ips.add(network.get("ip_address"))
+
+        try:
+            prom_targets = await app.state.mcp_manager.call("infra", "infra_manage_prometheus_targets", {
+                "action": "list"
+            })
+            if isinstance(prom_targets, dict) and prom_targets.get("jobs"):
+                for job in prom_targets["jobs"]:
+                    job_name = job.get("job_name", "")
+                    if job_name == "prometheus":
+                        continue
+                    targets = job.get("targets", [])
+                    for target in targets:
+                        target_ip = target.split(":")[0]
+                        if target_ip not in live_ips:
+                            logger.info("removing_stale_prometheus_target", job=job_name, target=target)
+                            await app.state.mcp_manager.call("infra", "infra_manage_prometheus_targets", {
+                                "action": "remove",
+                                "job_name": job_name
+                            })
+        except Exception as prom_err:
+            logger.warning(f"Failed to sync Prometheus targets: {prom_err}")
+
         logger.info("resources_synced", project_id=project_id, count=len(unique_droplets))
-        
+
         return {
             "message": f"Synced {len(unique_droplets)} resource(s)",
             "resources": unique_droplets

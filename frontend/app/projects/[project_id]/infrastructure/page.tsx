@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react"
 import Link from "next/link"
 import { useParams } from "next/navigation"
-import { ArrowLeft, RefreshCw, ZoomIn, ZoomOut, Maximize2 } from "lucide-react"
+import { ArrowLeft, RefreshCw, ZoomIn, ZoomOut, Maximize2, Trash2, Loader2, Flame } from "lucide-react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -44,6 +44,7 @@ export default function InfrastructureVisualizationPage() {
   const [loading, setLoading] = useState(true)
   const [selectedNode, setSelectedNode] = useState<InfrastructureNode | null>(null)
   const [zoom, setZoom] = useState(1)
+  const [destroyingInfra, setDestroyingInfra] = useState(false)
 
   useEffect(() => {
     if (projectId) {
@@ -70,19 +71,62 @@ export default function InfrastructureVisualizationPage() {
     }
   }
 
+  const handleDestroyInfrastructure = async () => {
+    if (!confirm(
+      `Are you sure you want to destroy ALL infrastructure for this project?\n\n` +
+      `This will run terraform destroy and permanently remove ${graph?.nodes.length || 0} resource(s) ` +
+      `from your cloud provider.\n\nThis action cannot be undone.`
+    )) {
+      return
+    }
+
+    setDestroyingInfra(true)
+    try {
+      const response = await fetch(`${API_URL}/projects/${projectId}/infrastructure`, {
+        method: "DELETE",
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        alert(`Infrastructure destroyed successfully.\n\n${data.message}`)
+        setSelectedNode(null)
+        fetchInfrastructureGraph() // Refresh — should now show empty
+      } else {
+        const errorData = await response.json().catch(() => ({ detail: "Unknown error" }))
+        alert(`Failed to destroy infrastructure: ${errorData.detail || "Unknown error"}`)
+      }
+    } catch (error) {
+      console.error("Failed to destroy infrastructure:", error)
+      alert("Failed to destroy infrastructure. Check console for details.")
+    } finally {
+      setDestroyingInfra(false)
+    }
+  }
+
   const getNodeColor = (type: string) => {
     switch (type.toLowerCase()) {
       case "droplet":
       case "vm":
+      case "ec2_instance":
         return "bg-blue-600"
       case "database":
+      case "rds_instance":
         return "bg-green-600"
       case "loadbalancer":
+      case "alb":
+      case "elb":
         return "bg-purple-600"
       case "storage":
+      case "volume":
+      case "s3_bucket":
         return "bg-yellow-600"
       case "kubernetes":
+      case "ecs":
+      case "eks":
         return "bg-cyan-600"
+      case "security_group":
+      case "firewall":
+        return "bg-orange-600"
       default:
         return "bg-gray-600"
     }
@@ -200,6 +244,24 @@ export default function InfrastructureVisualizationPage() {
                 onClick={() => setZoom(1)}
               >
                 <Maximize2 className="w-4 h-4" />
+              </Button>
+              <Button
+                variant="outline"
+                className="bg-red-600/20 border-red-500/50 text-red-400 hover:bg-red-600/30"
+                onClick={handleDestroyInfrastructure}
+                disabled={destroyingInfra}
+              >
+                {destroyingInfra ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Destroying...
+                  </>
+                ) : (
+                  <>
+                    <Flame className="w-4 h-4 mr-2" />
+                    Destroy All
+                  </>
+                )}
               </Button>
             </div>
           </div>
@@ -349,6 +411,30 @@ export default function InfrastructureVisualizationPage() {
                         </div>
                       </div>
                     )}
+                    {/* Destroy action */}
+                    <div className="pt-3 border-t border-gray-700">
+                      <Button
+                        variant="outline"
+                        className="w-full bg-red-600/20 border-red-500/50 text-red-400 hover:bg-red-600/30"
+                        onClick={handleDestroyInfrastructure}
+                        disabled={destroyingInfra}
+                      >
+                        {destroyingInfra ? (
+                          <>
+                            <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                            Destroying...
+                          </>
+                        ) : (
+                          <>
+                            <Trash2 className="w-4 h-4 mr-2" />
+                            Destroy Infrastructure
+                          </>
+                        )}
+                      </Button>
+                      <p className="text-xs text-gray-500 mt-2">
+                        Runs <code className="text-gray-400">terraform destroy</code> to remove all resources from your cloud provider.
+                      </p>
+                    </div>
                   </div>
                 ) : (
                   <div className="text-gray-400 text-center py-8">

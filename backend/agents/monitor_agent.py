@@ -8,8 +8,6 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from agents.base_agent import BaseAgent
-from mcp_clients.do_mcp import DigitalOceanMCP
-from mcp_clients.prometheus_mcp import PrometheusMCP
 from models.incident import (
     Incident,
     SeverityLevel,
@@ -40,8 +38,7 @@ class MonitorAgent(BaseAgent):
         agent_endpoint: str,
         agent_key: str,
         agent_id: str,
-        do_mcp: DigitalOceanMCP,
-        prometheus_mcp: PrometheusMCP,
+        mcp_manager=None,
         knowledge_base_id: Optional[str] = None,
         thresholds: Optional[Dict[MetricType, float]] = None
     ):
@@ -52,8 +49,7 @@ class MonitorAgent(BaseAgent):
             agent_endpoint: Gradient AI agent endpoint URL
             agent_key: API key for authentication
             agent_id: Unique agent identifier
-            do_mcp: DigitalOcean MCP client instance
-            prometheus_mcp: Prometheus MCP client instance
+            mcp_manager: MCPSessionManager instance
             knowledge_base_id: Optional knowledge base ID for RAG
             thresholds: Optional custom thresholds for metrics
         """
@@ -62,11 +58,10 @@ class MonitorAgent(BaseAgent):
             agent_key=agent_key,
             agent_id=agent_id,
             agent_name="Monitor Agent",
-            knowledge_base_id=knowledge_base_id
+            knowledge_base_id=knowledge_base_id,
+            mcp_manager=mcp_manager
         )
 
-        self.do_mcp = do_mcp
-        self.prometheus_mcp = prometheus_mcp
         self.thresholds = thresholds or self.DEFAULT_THRESHOLDS
 
         logger.info("Monitor Agent initialized with thresholds: %s", self.thresholds)
@@ -86,7 +81,7 @@ class MonitorAgent(BaseAgent):
         """
         try:
             # Get droplet info from DigitalOcean
-            droplet = await self.do_mcp.get_droplet(droplet_id)
+            droplet = await self.call_mcp("do", "get_droplet", {"droplet_id": droplet_id})
             droplet_name = droplet.get("name")
             # Use PUBLIC IP address - Prometheus is configured with public IPs
             # Find the public IP (type="public") from v4 networks
@@ -106,7 +101,7 @@ class MonitorAgent(BaseAgent):
             logger.info(f"Checking health of droplet {droplet_id} ({droplet_name}, {droplet_ip})")
 
             # Get metrics from Prometheus
-            metrics = await self.prometheus_mcp.get_all_metrics(instance)
+            metrics = await self.call_mcp("prometheus", "prometheus_get_all_metrics", {"instance": instance})
 
             incidents = []
 
@@ -177,7 +172,7 @@ class MonitorAgent(BaseAgent):
             logger.info(f"Checking all infrastructure (tag: {tag})")
 
             # Get all droplets with the specified tag
-            droplets = await self.do_mcp.list_droplets(tag=tag)
+            droplets = await self.call_mcp("do", "list_droplets", {"tag": tag})
             logger.info(f"Found {len(droplets)} droplets to monitor")
 
             all_incidents = []
@@ -366,12 +361,12 @@ class MonitorAgent(BaseAgent):
                 raise ValueError(f"Unsupported metric type: {metric}")
 
             # Get range data from Prometheus
-            result = await self.prometheus_mcp.query_range(
-                query=query,
-                start=start_time,
-                end=end_time,
-                step="1m"
-            )
+            result = await self.call_mcp("prometheus", "prometheus_query_range", {
+                "query": query,
+                "start": start_time.isoformat(),
+                "end": end_time.isoformat(),
+                "step": "1m"
+            })
 
             # Use AI to analyze the trend
             prompt = f"""

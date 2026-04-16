@@ -1,9 +1,8 @@
 """
 Direct Remediation Actions
-Execute immediate fixes via SSH and DigitalOcean API without Terraform
+Execute immediate fixes via MCP SSH and DigitalOcean API without Terraform
 """
 
-import os
 import logging
 import asyncio
 from typing import Dict, Any, List, Optional
@@ -24,19 +23,20 @@ class RemediationResult:
 class DirectRemediationExecutor:
     """
     Executes direct remediation actions on infrastructure
-    without needing Terraform - for fast, safe operations
+    without needing Terraform - for fast, safe operations.
+    All SSH commands go through the infra MCP server.
     """
-    
-    def __init__(self, do_mcp):
+
+    def __init__(self, mcp_manager):
         """
         Initialize executor
-        
+
         Args:
-            do_mcp: DigitalOcean MCP client for API access
+            mcp_manager: MCPSessionManager instance for MCP tool calls
         """
-        self.do_mcp = do_mcp
+        self.mcp_manager = mcp_manager
         logger.info("Direct Remediation Executor initialized")
-    
+
     async def execute_ssh_command(
         self,
         droplet_ip: str,
@@ -44,57 +44,34 @@ class DirectRemediationExecutor:
         timeout: int = 30
     ) -> tuple[bool, str, str]:
         """
-        Execute SSH command on a droplet
-        
+        Execute SSH command on a droplet via infra MCP server.
+
         Args:
             droplet_ip: IP address of droplet
             command: Command to execute
             timeout: Timeout in seconds
-            
+
         Returns:
             Tuple of (success, stdout, stderr)
         """
         try:
-            logger.info(f"Executing SSH command on {droplet_ip}: {command}")
-            
-            # Path to SSH key
-            ssh_key_path = os.path.expanduser("~/.ssh/id_ed25519_do_rift")
-            
-            # Build SSH command with key-based auth
-            ssh_command = [
-                "ssh",
-                "-i", ssh_key_path,
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", f"ConnectTimeout={timeout}",
-                f"root@{droplet_ip}",
-                command
-            ]
-            
-            # Execute with asyncio subprocess
-            process = await asyncio.create_subprocess_exec(
-                *ssh_command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=timeout
-            )
-            
-            success = process.returncode == 0
-            stdout_str = stdout.decode('utf-8', errors='ignore')
-            stderr_str = stderr.decode('utf-8', errors='ignore')
-            
+            logger.info(f"Executing SSH command on {droplet_ip} via MCP: {command}")
+
+            result = await self.mcp_manager.call("infra", "infra_execute_ssh_command", {
+                "host": droplet_ip,
+                "command": command,
+                "timeout": timeout,
+            })
+
+            success = result.get("success", False)
+            stdout = result.get("stdout", "")
+            stderr = result.get("stderr", "")
+
             logger.info(f"SSH command {'succeeded' if success else 'failed'}")
-            return success, stdout_str, stderr_str
-            
-        except asyncio.TimeoutError:
-            logger.error(f"SSH command timed out after {timeout}s")
-            return False, "", f"Command timed out after {timeout}s"
+            return success, stdout, stderr
+
         except Exception as e:
-            logger.error(f"SSH command failed: {str(e)}")
+            logger.error(f"SSH MCP call failed: {str(e)}")
             return False, "", str(e)
     
     async def restart_service_action(
@@ -376,7 +353,7 @@ class DirectRemediationExecutor:
         try:
             # Step 1: Get current droplet info
             logs.append("Step 1: Getting current droplet info...")
-            droplet = await self.do_mcp.get_droplet(droplet_id)
+            droplet = await self.mcp_manager.call("do", "get_droplet", {"droplet_id": droplet_id})
             
             current_size = droplet.get("size", {}).get("slug", "unknown")
             logs.append(f"Current size: {current_size}")
@@ -392,58 +369,53 @@ class DirectRemediationExecutor:
             
             # Step 2: Power off droplet (required for resize)
             logs.append("Step 2: Powering off droplet...")
-            power_off_result = await self.do_mcp.power_off_droplet(droplet_id)
+            power_off_result = await self.mcp_manager.call("do", "power_cycle_droplet", {"droplet_id": droplet_id})
             
-            if not power_off_result.get("success"):
+            if not power_off_result:
                 return RemediationResult(
                     success=False,
                     message="Failed to power off droplet",
-                    details={"error": power_off_result.get("error")},
+                    details={"error": "power cycle failed"},
                     logs=logs
                 )
-            
-            logs.append("✓ Droplet powered off")
-            
+
+            logs.append("✓ Droplet power cycle initiated")
+
             # Step 3: Wait for power-off to complete
             logs.append("Step 3: Waiting for power-off to complete...")
             await asyncio.sleep(10)
-            
+
             # Step 4: Resize droplet
             logs.append(f"Step 4: Resizing to {new_size}...")
-            resize_result = await self.do_mcp.resize_droplet(droplet_id, new_size)
-            
-            if not resize_result.get("success"):
-                # Try to power back on
-                logs.append("❌ Resize failed, powering droplet back on...")
-                await self.do_mcp.power_on_droplet(droplet_id)
-                
+            resize_result = await self.mcp_manager.call("do", "resize_droplet", {"droplet_id": droplet_id, "new_size": new_size})
+
+            if not resize_result:
+                logs.append("❌ Resize failed, rebooting droplet...")
+                await self.mcp_manager.call("do", "reboot_droplet", {"droplet_id": droplet_id})
+
                 return RemediationResult(
                     success=False,
                     message="Resize operation failed",
-                    details={"error": resize_result.get("error")},
+                    details={"error": "resize call failed"},
                     logs=logs
                 )
-            
+
             logs.append("✓ Resize initiated")
-            
+
             # Step 5: Wait for resize to complete
             logs.append("Step 5: Waiting for resize to complete (60 seconds)...")
             await asyncio.sleep(60)
-            
-            # Step 6: Power on droplet
-            logs.append("Step 6: Powering on droplet...")
-            power_on_result = await self.do_mcp.power_on_droplet(droplet_id)
-            
-            if not power_on_result.get("success"):
-                logs.append("⚠️  Warning: Failed to power on droplet automatically")
-            else:
-                logs.append("✓ Droplet powered on")
-            
+
+            # Step 6: Reboot droplet
+            logs.append("Step 6: Rebooting droplet...")
+            await self.mcp_manager.call("do", "reboot_droplet", {"droplet_id": droplet_id})
+            logs.append("✓ Droplet rebooted")
+
             # Step 7: Verify new size
             logs.append("Step 7: Verifying new size...")
             await asyncio.sleep(10)
-            
-            updated_droplet = await self.do_mcp.get_droplet(droplet_id)
+
+            updated_droplet = await self.mcp_manager.call("do", "get_droplet", {"droplet_id": droplet_id})
             final_size = updated_droplet.get("size", {}).get("slug", "unknown")
             
             logs.append(f"✅ Resize complete! New size: {final_size}")
